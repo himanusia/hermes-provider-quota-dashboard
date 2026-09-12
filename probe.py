@@ -13,12 +13,13 @@ Safety invariants:
   * never prints tokens or full account ids (short SHA-256 fingerprints only)
   * one row per unique credential, so multi-key pools show every key
 
-Run standalone:  python3 probe.py
+Run standalone:  python3 probe.py [--provider ID] [--account PROVIDER:FP]
 Overridable via env: HERMES_HOME, HERMES_AGENT_REPO.
 """
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import json
@@ -328,13 +329,37 @@ PROVIDERS = (
 )
 
 
+def parse_filters(argv):
+    """--provider <id> (repeatable) / --account <provider>:<fp-prefix> (repeatable)."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--provider", action="append", default=[])
+    parser.add_argument("--account", action="append", default=[])
+    args, _ = parser.parse_known_args(argv)
+    providers = {p.strip() for p in args.provider if p.strip()}
+    accounts: dict = {}
+    for entry in args.account:
+        provider, _, fp = entry.strip().partition(":")
+        if provider and fp:
+            accounts.setdefault(provider, set()).add(fp.lower())
+    return providers, accounts
+
+
 def main() -> int:
     started = time.time()
+    only_providers, account_filters = parse_filters(sys.argv[1:])
+    wanted = set(only_providers) | set(account_filters)
+
     jobs = []
     per_provider = {}
     for provider in PROVIDERS:
-        accounts = accounts_for(provider["id"], provider["env_var"], provider["base"])
-        per_provider[provider["id"]] = accounts
+        pid = provider["id"]
+        if wanted and pid not in wanted:
+            continue
+        accounts = accounts_for(pid, provider["env_var"], provider["base"])
+        if pid in account_filters:
+            prefixes = account_filters[pid]
+            accounts = [a for a in accounts if any(a["fp"].startswith(p) for p in prefixes)]
+        per_provider[pid] = accounts
         for account in accounts:
             jobs.append((provider, account))
 
@@ -356,10 +381,13 @@ def main() -> int:
             {
                 "id": provider["id"],
                 "name": provider["name"],
-                "accounts": [results[(provider["id"], account["fp"])]
-                             for account in per_provider[provider["id"]]],
+                "accounts": [
+                    {**results[(provider["id"], account["fp"])], "fp": account["fp"]}
+                    for account in per_provider[provider["id"]]
+                ],
             }
             for provider in PROVIDERS
+            if provider["id"] in per_provider
         ],
     }
     print(SENTINEL + " " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")))

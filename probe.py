@@ -9,7 +9,9 @@ parallel, and prints exactly one machine-readable line:
 
 Safety invariants:
   * read-only: no token refresh, no pool mutation, no reset-credit redemption
-  * never prints tokens or full account ids (short SHA-256 fingerprints only)
+  * never prints tokens or full account ids (short SHA-256 fingerprints only);
+    account handles only - email addresses never leave the host (masked if
+    they would be the only identifier)
   * one row per unique credential, so multi-key pools show every key
 
 Run standalone:  python3 probe.py [--provider ID] [--account PROVIDER:FP]
@@ -274,9 +276,14 @@ def probe_commandcode(account: dict) -> dict:
         summary = get("/alpha/usage/summary")
 
         user = whoami.get("user") or {}
-        who = " - ".join(p for p in (user.get("userName") or user.get("name"), user.get("email")) if p)
-        if who:
-            row["sub"] = f"{who} - fp {sha(token)[:6]}"
+        name = str(user.get("userName") or user.get("name") or "").strip()
+        email = str(user.get("email") or "").strip()
+        # The account's email is personal data - keep it out of the payload.
+        # Show the handle only; if there is no handle, a masked fallback.
+        if not name and email:
+            name = email[:2] + "***@***"
+        if name:
+            row["sub"] = f"{name} - fp {sha(token)[:6]}"
 
         sub = subscription.get("data") or {}
         plan_id = str(sub.get("planId") or "")

@@ -137,8 +137,9 @@ one row per credential — the UI collapses rows that share an `acct`.
 - **Read-only by design.** The probe never refreshes tokens, never mutates
   credential pools, never redeems reset credits, and never re-authenticates.
   An expired token shows an `HTTP 401` hint instead of a silent refresh.
-- **Secrets never leave the host.** The pane receives numbers and short
-  SHA-256 fingerprints only — no tokens, no full account ids.
+- **Secrets never leave the host.** The pane receives numbers, account
+  handles, and short SHA-256 fingerprints only — no tokens, no full account
+  ids, no email addresses (an email-only account shows a masked fallback).
 - **No credentials in this repo.** Keys are read at runtime from the Hermes
   credential pool / `~/.hermes/.env` on your machine.
 

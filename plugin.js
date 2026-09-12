@@ -297,7 +297,7 @@ function QuotaPane() {
       .then(payload => {
         const fresh = (payload.providers || [])[0] && (payload.providers[0].accounts || [])[0]
 
-        if (!fresh) {
+        if (!fresh || !fresh.fp) {
           throw new Error(`no data for ${label}`)
         }
 
@@ -313,7 +313,10 @@ function QuotaPane() {
                 ? {
                     ...provider,
                     accounts: provider.accounts.map(account =>
-                      account.fp === fresh.fp || account.label === fresh.label ? fresh : account
+                      // Match by fingerprint only. The label fallback could
+                      // collide when two rows share a label and would clobber
+                      // the wrong account; fp is always present and unique.
+                      account.fp && fresh.fp && account.fp === fresh.fp ? fresh : account
                     )
                   }
                 : provider

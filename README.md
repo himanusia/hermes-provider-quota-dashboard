@@ -23,8 +23,11 @@ in this screenshot.)*
 | **OpenCode Go** | rolling (5h) / weekly / monthly usage % of each window's cap, with reset times |
 | **CommandCode** | plan (GOAT / Pro / Max / Go / Teams), 5h and weekly windows ($ used / cap), monthly credit balance, renewal date, and the current billing period's request/token totals |
 
-Plus ⌘K palette commands: **Quota: refresh dashboard**, **Quota: open in main
-workspace**, **Quota: hide pane**, and **Quota: show pane**.
+Ways to open it: a **quota** chip in the status bar (toggles the pane open /
+closed; highlighted while the pane is on screen), a **Quota Dashboard** row in
+the left sidebar (opens the full-page view), and ⌘K palette commands:
+**Quota: refresh dashboard**, **Quota: open in main workspace**,
+**Quota: open as page**, **Quota: hide pane**, **Quota: show pane**.
 
 Refresh at three granularities: **Refresh all** in the pane header, a **↻ button
 per provider**, and a **↻ button on every account card**. A per-provider or

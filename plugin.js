@@ -1,6 +1,10 @@
 /**
- * quota-dash — Hermes Desktop pane: live quota for EVERY account of
- * OpenAI Codex (credential pool), OpenCode Go, and CommandCode.
+ * Hermes Provider Quota Dashboard — Hermes Desktop plugin
+ * https://github.com/himanusia/hermes-provider-quota-dashboard
+ *
+ * A desktop pane with live quota readouts for EVERY account of OpenAI Codex
+ * (credential pool), OpenCode Go, and CommandCode — with refresh controls at
+ * global, per-provider, and per-account granularity.
  *
  * Data path: probe.py runs on the backend host via the gateway's `shell.exec`
  * RPC (read-only; secrets never leave the host). The probe prints one
@@ -24,6 +28,7 @@ import {
   queryClient,
   useQuery
 } from '@hermes/plugin-sdk'
+import { useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'quota-dash'
@@ -35,8 +40,20 @@ const SENTINEL = '@@QUOTA@@'
 const PROBE_CMD =
   '/usr/bin/env -u PYTHONPATH "$HOME/.hermes/hermes-agent/venv/bin/python" "$HOME/.hermes/desktop-plugins/quota-dash/probe.py"'
 
-async function fetchQuotas() {
-  const result = await host.request('shell.exec', { command: PROBE_CMD })
+function buildProbeCommand({ provider, account } = {}) {
+  let cmd = PROBE_CMD
+
+  if (account && /^[a-z0-9-]+:[0-9a-f]{6,12}$/.test(account)) {
+    cmd += ` --account ${account}`
+  } else if (provider && /^[a-z0-9-]+$/.test(provider)) {
+    cmd += ` --provider ${provider}`
+  }
+
+  return cmd
+}
+
+async function fetchQuotas(filters) {
+  const result = await host.request('shell.exec', { command: buildProbeCommand(filters) })
   const stdout = String((result && result.stdout) || '')
   const marker = stdout.lastIndexOf(SENTINEL)
 
@@ -50,6 +67,17 @@ async function fetchQuotas() {
   }
 
   return JSON.parse(stdout.slice(marker + SENTINEL.length).trim().split('\n')[0])
+}
+
+function mergeProvider(previous, fresh) {
+  if (!previous) {
+    return { providers: [fresh] }
+  }
+
+  return {
+    ...previous,
+    providers: previous.providers.map(provider => (provider.id === fresh.id ? fresh : provider))
+  }
 }
 
 function resetLabel(iso) {
@@ -78,6 +106,17 @@ function resetLabel(iso) {
   }
 
   return hours > 0 ? `reset ${hours}h ${minutes % 60}m` : `reset ${minutes}m`
+}
+
+function RefreshButton({ busy, onRefresh, label }) {
+  return jsx(Button, {
+    variant: 'ghost',
+    className: 'h-5 w-5 shrink-0 p-0 text-[0.7rem] leading-none',
+    disabled: busy,
+    onClick: onRefresh,
+    title: label,
+    children: busy ? jsx(GlyphSpinner, { className: 'size-2.5' }) : '↻'
+  })
 }
 
 function WindowRow({ window: w }) {
@@ -109,7 +148,7 @@ function WindowRow({ window: w }) {
   })
 }
 
-function AccountCard({ account, duplicateOf }) {
+function AccountCard({ account, duplicateOf, busy, onRefresh }) {
   const notes = account.notes || []
   const windows = account.windows || []
 
@@ -117,10 +156,11 @@ function AccountCard({ account, duplicateOf }) {
     className: 'flex flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-2',
     children: [
       jsxs('div', {
-        className: 'flex items-center justify-between gap-2',
+        className: 'flex items-center gap-1.5',
         children: [
-          jsx('div', { className: 'truncate text-xs font-medium', children: account.label }),
-          account.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: account.plan }) : null
+          jsx('div', { className: 'min-w-0 flex-1 truncate text-xs font-medium', children: account.label }),
+          account.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: account.plan }) : null,
+          jsx(RefreshButton, { busy, onRefresh, label: `Refresh ${account.label}` })
         ]
       }),
       account.sub
@@ -142,7 +182,7 @@ function AccountCard({ account, duplicateOf }) {
   })
 }
 
-function ProviderSection({ provider }) {
+function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRefreshAccount }) {
   const seen = new Map()
   const accounts = (provider.accounts || []).map(account => {
     let duplicateOf = null
@@ -160,10 +200,11 @@ function ProviderSection({ provider }) {
     className: 'flex flex-col gap-2',
     children: [
       jsxs('div', {
-        className: 'flex items-center justify-between gap-2',
+        className: 'flex items-center gap-1.5',
         children: [
-          jsx('div', { className: 'text-xs font-medium', children: provider.name }),
-          jsx(Badge, { variant: 'outline', size: 'xs', children: String(accounts.length) })
+          jsx('div', { className: 'min-w-0 flex-1 truncate text-xs font-medium', children: provider.name }),
+          jsx(Badge, { variant: 'outline', size: 'xs', children: String(accounts.length) }),
+          jsx(RefreshButton, { busy, onRefresh: onRefreshProvider, label: `Refresh ${provider.name}` })
         ]
       }),
       accounts.length === 0
@@ -171,8 +212,13 @@ function ProviderSection({ provider }) {
         : accounts.map(account =>
             jsx(
               AccountCard,
-              { account, duplicateOf: account.duplicateOf },
-              `${account.label}|${account.sub}`
+              {
+                account,
+                duplicateOf: account.duplicateOf,
+                busy: Boolean(busyAccounts[`${provider.id}:${account.fp}`]),
+                onRefresh: () => onRefreshAccount(provider.id, account.fp, account.label)
+              },
+              `${provider.id}|${account.label}|${account.fp}`
             )
           )
     ]
@@ -180,17 +226,76 @@ function ProviderSection({ provider }) {
 }
 
 function QuotaPane() {
+  const [busyProviders, setBusyProviders] = useState({})
+  const [busyAccounts, setBusyAccounts] = useState({})
+
   const query = useQuery({
     queryKey: QUERY_KEY,
-    queryFn: fetchQuotas,
+    queryFn: () => fetchQuotas(),
     refetchInterval: 60_000,
     staleTime: 30_000,
     retry: 1
   })
 
-  const refresh = () => {
+  const failure = err =>
+    host.notify({ kind: 'error', message: `quota refresh failed: ${(err && err.message) || err}` })
+
+  const refreshAll = () => {
     haptic('tap')
     void queryClient.invalidateQueries({ queryKey: QUERY_KEY })
+  }
+
+  const refreshProvider = providerId => {
+    haptic('tap')
+    setBusyProviders(previous => ({ ...previous, [providerId]: true }))
+    fetchQuotas({ provider: providerId })
+      .then(payload => {
+        const fresh = (payload.providers || [])[0]
+
+        if (!fresh) {
+          throw new Error(`no data for ${providerId}`)
+        }
+
+        queryClient.setQueryData(QUERY_KEY, previous => mergeProvider(previous, fresh))
+      })
+      .catch(failure)
+      .finally(() => setBusyProviders(previous => ({ ...previous, [providerId]: false })))
+  }
+
+  const refreshAccount = (providerId, fp, label) => {
+    haptic('tap')
+    const key = `${providerId}:${fp}`
+    setBusyAccounts(previous => ({ ...previous, [key]: true }))
+    fetchQuotas({ account: key })
+      .then(payload => {
+        const fresh = (payload.providers || [])[0] && (payload.providers[0].accounts || [])[0]
+
+        if (!fresh) {
+          throw new Error(`no data for ${label}`)
+        }
+
+        queryClient.setQueryData(QUERY_KEY, previous => {
+          if (!previous) {
+            return previous
+          }
+
+          return {
+            ...previous,
+            providers: previous.providers.map(provider =>
+              provider.id === providerId
+                ? {
+                    ...provider,
+                    accounts: provider.accounts.map(account =>
+                      account.fp === fresh.fp || account.label === fresh.label ? fresh : account
+                    )
+                  }
+                : provider
+            )
+          }
+        })
+      })
+      .catch(failure)
+      .finally(() => setBusyAccounts(previous => ({ ...previous, [key]: false })))
   }
 
   const fetchedAt = query.data && query.data.fetchedAt ? new Date(query.data.fetchedAt) : null
@@ -213,10 +318,10 @@ function QuotaPane() {
                 : null,
               jsx(Button, {
                 variant: 'ghost',
-                size: 'sm',
-                onClick: refresh,
+                className: 'h-5 px-1 text-[0.7rem]',
+                onClick: refreshAll,
                 disabled: query.isFetching,
-                children: query.isFetching ? jsx(GlyphSpinner, { className: 'size-3' }) : 'Refresh'
+                children: query.isFetching ? jsx(GlyphSpinner, { className: 'size-2.5' }) : 'Refresh all'
               })
             ]
           })
@@ -247,21 +352,29 @@ function QuotaPane() {
                     jsx('code', { children: '~/.hermes/hermes-agent/venv/bin/python ~/.hermes/desktop-plugins/quota-dash/probe.py' })
                   ]
                 }),
-                jsx(Button, { variant: 'outline', size: 'sm', className: 'mt-1 w-fit', onClick: refresh, children: 'Retry' })
+                jsx(Button, { variant: 'outline', className: 'mt-1 w-fit h-5 px-1 text-[0.7rem]', onClick: refreshAll, children: 'Retry' })
               ]
             })
           : jsxs('div', {
               className: 'flex flex-col gap-3',
               children: [
                 ...((query.data && query.data.providers) || []).map(provider =>
-                  jsx(ProviderSection, { provider }, provider.id)
+                  jsx(
+                    ProviderSection,
+                    {
+                      provider,
+                      busy: Boolean(busyProviders[provider.id]),
+                      busyAccounts,
+                      onRefreshProvider: () => refreshProvider(provider.id),
+                      onRefreshAccount: refreshAccount
+                    },
+                    provider.id
+                  )
                 ),
-                query.data && query.data.elapsedMs
-                  ? jsx('div', {
-                      className: 'text-[0.65rem] text-(--ui-text-quaternary)',
-                      children: `read-only probe · ${Math.round(query.data.elapsedMs / 100) / 10}s · secrets never leave the host`
-                    })
-                  : null
+                jsx('div', {
+                  className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+                  children: 'read-only probe · ↻ per provider/account · secrets never leave the host'
+                })
               ]
             })
     ]
@@ -270,7 +383,7 @@ function QuotaPane() {
 
 export default {
   id: ID,
-  name: 'Quota Dashboard',
+  name: 'Provider Quota Dashboard',
   register(ctx) {
     ctx.register({
       id: 'pane',

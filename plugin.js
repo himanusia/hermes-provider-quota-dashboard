@@ -159,16 +159,21 @@ function AccountCard({ account, sharedCreds, busy, onRefresh }) {
   const notes = account.notes || []
   const windows = account.windows || []
   const creds = sharedCreds || []
+  const merged = creds.length > 1
+  const title = merged ? creds.map(cred => cred.label).join(' · ') : account.label
 
   return jsxs('div', {
     className: 'flex flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-2',
     children: [
       jsxs('div', {
-        className: 'flex items-center gap-1.5',
+        className: 'flex items-start gap-1.5',
         children: [
-          jsx('div', { className: 'min-w-0 flex-1 truncate text-xs font-medium', children: account.label }),
+          jsx('div', {
+            className: cn('min-w-0 flex-1 text-xs font-medium', merged ? 'break-words leading-snug' : 'truncate'),
+            children: title
+          }),
           account.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: account.plan }) : null,
-          jsx(RefreshButton, { busy, onRefresh, label: `Refresh ${account.label}` })
+          jsx(RefreshButton, { busy, onRefresh, label: merged ? 'Refresh all credentials' : `Refresh ${account.label}` })
         ]
       }),
       account.sub
@@ -177,10 +182,10 @@ function AccountCard({ account, sharedCreds, busy, onRefresh }) {
       windows.length
         ? jsxs('div', { className: 'flex flex-col gap-2', children: windows.map(w => jsx(WindowRow, { window: w, key: w.k })) })
         : null,
-      creds.length > 1
+      merged
         ? jsx('div', {
-            className: 'text-[0.65rem] break-words text-(--ui-text-quaternary)',
-            children: `shared by ${creds.length} credentials: ${creds.map(cred => cred.label).join(' · ')}`
+            className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+            children: `${creds.length} credentials share one account's quota`
           })
         : null,
       creds

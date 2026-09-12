@@ -155,9 +155,10 @@ function WindowRow({ window: w }) {
   })
 }
 
-function AccountCard({ account, duplicateOf, busy, onRefresh }) {
+function AccountCard({ account, sharedCreds, busy, onRefresh }) {
   const notes = account.notes || []
   const windows = account.windows || []
+  const creds = sharedCreds || []
 
   return jsxs('div', {
     className: 'flex flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-2',
@@ -176,9 +177,17 @@ function AccountCard({ account, duplicateOf, busy, onRefresh }) {
       windows.length
         ? jsxs('div', { className: 'flex flex-col gap-2', children: windows.map(w => jsx(WindowRow, { window: w, key: w.k })) })
         : null,
-      duplicateOf
-        ? jsx('div', { className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: `same account as "${duplicateOf}"` })
+      creds.length > 1
+        ? jsx('div', {
+            className: 'text-[0.65rem] break-words text-(--ui-text-quaternary)',
+            children: `shared by ${creds.length} credentials: ${creds.map(cred => cred.label).join(' · ')}`
+          })
         : null,
+      creds
+        .filter(cred => cred.error)
+        .map((cred, index) =>
+          jsx('div', { className: 'text-[0.65rem] text-(--ui-text-secondary)', children: `⚠ ${cred.label}: ${cred.error}` }, `cred-error-${index}`)
+        ),
       notes.map((note, index) =>
         jsx('div', { className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: note }, `note-${index}`)
       ),
@@ -190,18 +199,23 @@ function AccountCard({ account, duplicateOf, busy, onRefresh }) {
 }
 
 function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRefreshAccount }) {
-  const seen = new Map()
-  const accounts = (provider.accounts || []).map(account => {
-    let duplicateOf = null
+  // Credentials that resolve to the same account share one quota — collapse
+  // them into a single card; the card lists the credentials that share it.
+  const groups = []
 
-    if (account.acct && seen.has(account.acct)) {
-      duplicateOf = seen.get(account.acct)
-    } else if (account.acct) {
-      seen.set(account.acct, account.label)
+  for (const account of provider.accounts || []) {
+    const key = account.acct ? `acct:${account.acct}` : `cred:${account.fp || account.label}`
+    let group = groups.find(candidate => candidate.key === key)
+
+    if (!group) {
+      group = { key, account, creds: [] }
+      groups.push(group)
+    } else if (group.account.error && !account.error) {
+      group.account = account
     }
 
-    return { ...account, duplicateOf }
-  })
+    group.creds.push({ label: account.label, fp: account.fp, error: account.error })
+  }
 
   return jsxs('div', {
     className: 'flex flex-col gap-2',
@@ -210,22 +224,22 @@ function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRe
         className: 'flex items-center gap-1.5',
         children: [
           jsx('div', { className: 'min-w-0 flex-1 truncate text-xs font-medium', children: provider.name }),
-          jsx(Badge, { variant: 'outline', size: 'xs', children: String(accounts.length) }),
+          jsx(Badge, { variant: 'outline', size: 'xs', children: String(groups.length) }),
           jsx(RefreshButton, { busy, onRefresh: onRefreshProvider, label: `Refresh ${provider.name}` })
         ]
       }),
-      accounts.length === 0
+      groups.length === 0
         ? jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: 'no credentials found' })
-        : accounts.map(account =>
+        : groups.map(group =>
             jsx(
               AccountCard,
               {
-                account,
-                duplicateOf: account.duplicateOf,
-                busy: Boolean(busyAccounts[`${provider.id}:${account.fp}`]),
-                onRefresh: () => onRefreshAccount(provider.id, account.fp, account.label)
+                account: group.account,
+                sharedCreds: group.creds,
+                busy: group.creds.some(cred => Boolean(busyAccounts[`${provider.id}:${cred.fp}`])),
+                onRefresh: () => group.creds.filter(cred => cred.fp).forEach(cred => onRefreshAccount(provider.id, cred.fp, cred.label))
               },
-              `${provider.id}|${account.label}|${account.fp}`
+              `${provider.id}|${group.key}`
             )
           )
     ]

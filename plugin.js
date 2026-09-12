@@ -381,17 +381,21 @@ function QuotaPane() {
   })
 }
 
+function paneContribution() {
+  return {
+    id: 'pane',
+    area: 'panes',
+    title: 'quotas',
+    data: { placement: 'right', width: '300px' },
+    render: () => jsx(QuotaPane, {})
+  }
+}
+
 export default {
   id: ID,
   name: 'Provider Quota Dashboard',
   register(ctx) {
-    ctx.register({
-      id: 'pane',
-      area: 'panes',
-      title: 'quotas',
-      data: { placement: 'right', width: '300px' },
-      render: () => jsx(QuotaPane, {})
-    })
+    let paneDisposer = ctx.register(paneContribution())
 
     ctx.register({
       id: 'refresh',
@@ -423,6 +427,39 @@ export default {
             })
           } else {
             host.notify({ kind: 'info', message: 'The quota pane lives in the right panel (tab: quotas).' })
+          }
+        }
+      }
+    })
+
+    ctx.register({
+      id: 'hide',
+      area: PALETTE_AREA,
+      data: {
+        id: 'quota-dash.hide',
+        label: 'Quota: hide pane',
+        keywords: ['quota', 'hide', 'close', 'pane'],
+        run: () => {
+          if (paneDisposer) {
+            paneDisposer()
+            paneDisposer = null
+            host.notify({ kind: 'info', message: 'Quota pane hidden — restore with ⌘K "Quota: show pane".' })
+          }
+        }
+      }
+    })
+
+    ctx.register({
+      id: 'show',
+      area: PALETTE_AREA,
+      data: {
+        id: 'quota-dash.show',
+        label: 'Quota: show pane',
+        keywords: ['quota', 'show', 'open', 'pane'],
+        run: () => {
+          if (!paneDisposer) {
+            paneDisposer = ctx.register(paneContribution())
+            host.notify({ kind: 'info', message: 'Quota pane restored.' })
           }
         }
       }

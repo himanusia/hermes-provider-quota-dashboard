@@ -9,22 +9,11 @@ the one currently selected.
 Built with the Hermes Desktop Plugin SDK (`@hermes/plugin-sdk`) — plain ESM, no
 build step. Drop it in the desktop plugin door and the app hot-loads it.
 
-```
-┌─ quotas ────────────────────────────────┐
-│ Quota Dashboard         18:30   Refresh │
-│                                         │
-│ Codex (ChatGPT)                     ③   │
-│ ┌─────────────────────────────────────┐ │
-│ │ openai-codex-oauth-2          Plus  │ │
-│ │ fp cde3ee · acct 332491 · exp …     │ │
-│ │ session (5h)          0% · reset 5h │ │
-│ │ ▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │ │
-│ │ weekly                0% · reset 7d │ │
-│ └─────────────────────────────────────┘ │
-│ OpenCode Go                         ①   │
-│ CommandCode                        GOAT │
-└─────────────────────────────────────────┘
-```
+![Quota Dashboard pane in Hermes Desktop](docs/screenshot.png)
+
+*The pane in a live Hermes Desktop session — every Codex credential in the pool,
+OpenCode Go, and CommandCode, each with its own refresh. (Account email redacted
+in this screenshot.)*
 
 ## What it shows
 

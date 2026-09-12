@@ -1,23 +1,129 @@
-# quota-dash
+# quota-dash — Hermes Desktop plugin
 
-Read-only quota dashboard for **Hermes Desktop**: live subscription/limit
-readouts for **OpenAI Codex** (every account in the credential pool),
-**OpenCode Go**, and **CommandCode** (GOAT / Pro / Max / Go / Teams) in a
-single desktop pane.
+A **[Hermes Desktop](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk) plugin**
+that puts a live quota dashboard in a side pane: subscription limits for
+**OpenAI Codex**, **OpenCode Go**, and **CommandCode** — for *every* account in
+your Hermes credential pools, not just the one currently selected.
 
-> Work in progress — full README lands with the first verified release.
+Built with the Hermes Desktop Plugin SDK (`@hermes/plugin-sdk`) — plain ESM, no
+build step. Drop it in the desktop plugin door and the app hot-loads it.
 
-## How it works (short version)
+```
+┌─ quotas ────────────────────────────────┐
+│ Quota Dashboard         18:30   Refresh │
+│                                         │
+│ Codex (ChatGPT)                     ③   │
+│ ┌─────────────────────────────────────┐ │
+│ │ openai-codex-oauth-2          Plus  │ │
+│ │ fp cde3ee · acct 332491 · exp …     │ │
+│ │ session (5h)          0% · reset 5h │ │
+│ │ ▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │ │
+│ │ weekly                0% · reset 7d │ │
+│ └─────────────────────────────────────┘ │
+│ OpenCode Go                         ①   │
+│ CommandCode                        GOAT │
+└─────────────────────────────────────────┘
+```
 
-- `probe.py` — a read-only Python probe. It enumerates the Hermes credential
-  pools (and `.env` fallbacks) per provider, hits each provider's usage API,
-  and prints one machine-readable JSON line. It never prints tokens, never
-  refreshes credentials, and never redeems reset credits.
-- `plugin.js` — a Hermes Desktop plugin (plain ESM, no build step). A pane
-  fetches `probe.py`'s JSON through the gateway's `shell.exec` RPC and renders
-  per-account bars with reset countdowns.
-- `install.sh` — copies both files into
-  `~/.hermes/desktop-plugins/quota-dash/`.
+## What it shows
+
+| Provider | Per-account readout |
+|---|---|
+| **OpenAI Codex** | every pool credential: plan, 5h session + weekly windows (% used, reset time), banked resets, credit balance, token expiry, and short credential/account fingerprints. Accounts that resolve to the same ChatGPT account are labelled `same account as …` |
+| **OpenCode Go** | rolling (5h) / weekly / monthly usage % of each window's cap, with reset times |
+| **CommandCode** | plan (GOAT / Pro / Max / Go / Teams), 5h and weekly windows ($ used / cap), monthly credit balance, renewal date, and the current billing period's request/token totals |
+
+Plus two ⌘K palette commands: **Quota: refresh dashboard** and
+**Quota: open in main workspace**.
+
+## Install
+
+Requires [Hermes Desktop](https://github.com/NousResearch/hermes-agent) with
+the desktop plugin door (`~/.hermes/desktop-plugins/`).
+
+```bash
+git clone https://github.com/himanusia/quota-dash.git
+cd quota-dash
+./install.sh
+```
+
+`install.sh` copies `plugin.js` + `probe.py` into
+`~/.hermes/desktop-plugins/quota-dash/`. The app watches that folder and loads
+the plugin within seconds; if the pane does not appear, run
+**⌘K → Reload desktop plugins**. The pane (`quotas`) docks into the right
+panel — drag it wherever you like afterwards.
+
+Manual install is the same two files:
+
+```bash
+mkdir -p ~/.hermes/desktop-plugins/quota-dash
+cp plugin.js probe.py ~/.hermes/desktop-plugins/quota-dash/
+```
+
+Verify the probe standalone (uses the Hermes venv Python):
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python \
+  ~/.hermes/desktop-plugins/quota-dash/probe.py
+```
+
+## How it works
+
+```
+plugin.js (desktop pane)
+   └─ host.request('shell.exec')            ← gateway JSON-RPC
+        └─ probe.py  (backend host)         ← read-only probe
+             ├─ Hermes credential pool      (agent.credential_pool)
+             ├─ ~/.hermes/.env fallbacks
+             └─ provider usage APIs         → @@QUOTA@@ {json}
+```
+
+`probe.py` enumerates every credential for each provider (pool rows first,
+then `.env` fallbacks), probes the provider APIs in parallel, and prints a
+single `@@QUOTA@@ {json}` line. `plugin.js` fetches that line through the
+gateway's `shell.exec` RPC, parses it, and renders the bars — refreshed every
+60 s and on demand.
+
+### Data endpoints
+
+| Provider | Endpoint | Credential |
+|---|---|---|
+| Codex | `chatgpt.com/backend-api/wham/usage` (or `/api/codex/usage`) | ChatGPT OAuth token per pool entry |
+| OpenCode Go | `https://opencode.ai/zen/go/v1/usage` | `OPENCODE_GO_API_KEY` |
+| CommandCode | `https://api.commandcode.ai/alpha/{whoami,billing/credits,billing/subscriptions,usage/summary}` | `COMMANDCODE_API_KEY` |
+
+## Security & safety
+
+- **Read-only by design.** The probe never refreshes tokens, never mutates
+  credential pools, never redeems reset credits, and never re-authenticates.
+  An expired token shows an `HTTP 401` hint instead of a silent refresh.
+- **Secrets never leave the host.** The pane receives numbers and short
+  SHA-256 fingerprints only — no tokens, no full account ids.
+- **No credentials in this repo.** Keys are read at runtime from the Hermes
+  credential pool / `~/.hermes/.env` on your machine.
+
+## Verified
+
+Live-verified 2026-09-12 on macOS (Hermes Desktop, local backend):
+
+- **Codex** — 3 pool entries probed, all HTTP 200; the three entries resolve to
+  the *same* ChatGPT account and the pane labels the duplicates.
+- **OpenCode Go** — rolling/weekly/monthly windows returned and rendered.
+- **CommandCode** — GOAT plan: 5h + weekly windows, credit balance, period
+  totals returned and rendered.
+
+## Limitations
+
+- Codex access tokens expire; this tool reports the 401 rather than refreshing
+  (use the account, or re-auth, then refresh the pane).
+- CommandCode support uses the same `/alpha/…` endpoints its own CLI uses for
+  `/usage` — undocumented, and may change without notice.
+- OpenCode Go percentages are the provider's own usage % of each window cap
+  (5-hour = 20% of the monthly limit, weekly = 50%; see opencode.ai/docs/go).
+  Numbers are shown exactly as returned; nothing is recomputed locally.
+- The pane needs the backend host to have the Hermes venv
+  (`~/.hermes/hermes-agent/venv`) and `~/.hermes/.env` in the usual place.
+  Edit `PROBE_CMD` in `plugin.js` if your install differs.
 
 ## License
 

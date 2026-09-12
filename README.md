@@ -24,8 +24,11 @@ screenshot.)*
 | **OpenCode Go** | rolling (5h) / weekly / monthly usage % of each window's cap, with reset times |
 | **CommandCode** | plan (GOAT / Pro / Max / Go / Teams), 5h and weekly windows ($ used / cap), monthly credit balance, renewal date, and the current billing period's request/token totals |
 
-Ways to open it: a **quota** chip in the status bar (toggles the pane open /
-closed; highlighted while the pane is open), a **Quota Dashboard** row in
+Ways to open it: a **status-bar chip** that tracks the live session — it maps
+the session's model slug to a provider and shows that provider's 5h usage
+(e.g. `OG 5h 6%`), and toggles the pane open / closed (highlighted while the
+pane is open); a
+**Quota Dashboard** row in
 the left sidebar (opens the full-page view), and ⌘K palette commands:
 **Quota: refresh dashboard**, **Quota: open in main workspace**,
 **Quota: open as page**, **Quota: hide pane**, **Quota: show pane**.
@@ -155,6 +158,12 @@ re-verify anytime with the standalone probe above.
 - OpenCode Go percentages are the provider's own usage % of each window cap
   (5-hour = 20% of the monthly limit, weekly = 50%; see opencode.ai/docs/go).
   Numbers are shown exactly as returned; nothing is recomputed locally.
+- The status-bar chip derives its provider from the session's model slug:
+  provider-prefixed slugs (`opencode-go/…`) resolve exactly; bare slugs use a
+  small keyword table (`deepseek/kimi/qwen/glm/… → OpenCode Go`,
+  `luna/sol/terra/gpt-5… → Codex`, `…goat… → CommandCode`). Unmapped models
+  fall back to the tightest 5h window across all providers — the provider tag
+  still shows which one.
 - The pane needs the backend host to have the Hermes venv
   (`~/.hermes/hermes-agent/venv`) and `~/.hermes/.env` in the usual place.
   Edit `PROBE_CMD` in `plugin.js` if your install differs.

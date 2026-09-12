@@ -20,6 +20,7 @@
 import {
   Badge,
   Button,
+  Codicon,
   GlyphSpinner,
   PALETTE_AREA,
   ROUTES_AREA,
@@ -454,12 +455,121 @@ function togglePane() {
   }
 }
 
+const $modelFallback = atom('')
+
+// --- statusbar chip: the live session's provider + its 5h limit ---------------
+
+const PROVIDER_TAGS = { 'openai-codex': 'CX', 'opencode-go': 'OG', commandcode: 'CC' }
+const PROVIDER_ICONS = { 'openai-codex': 'sparkle', 'opencode-go': 'code', commandcode: 'terminal' }
+const PROVIDER_ALIASES = {
+  'openai-codex': 'openai-codex',
+  codex: 'openai-codex',
+  'opencode-go': 'opencode-go',
+  'opencode-go-sub': 'opencode-go',
+  go: 'opencode-go',
+  zen: 'opencode-go',
+  commandcode: 'commandcode',
+  'commandcode-chat': 'commandcode',
+  'commandcode-claude': 'commandcode',
+  'commandcode-anthropic': 'commandcode'
+}
+
+/** Best-effort map from a model slug (`host.model`) to one of the quota
+ * providers. Provider-prefixed slugs ("opencode-go/…") resolve exactly; bare
+ * slugs use a small keyword table. Unmapped → null; the chip then falls back
+ * to the tightest 5h window across all providers, tag included. */
+function providerForModel(slug) {
+  const text = String(slug || '').toLowerCase().trim()
+
+  if (!text) {
+    return null
+  }
+
+  const prefix = text.includes('/') ? text.split('/')[0] : null
+
+  if (prefix && PROVIDER_ALIASES[prefix]) {
+    return PROVIDER_ALIASES[prefix]
+  }
+
+  if (text.includes('commandcode') || text.includes('goat')) {
+    return 'commandcode'
+  }
+
+  if (/deepseek|kimi|qwen|glm|minimax|grok|hy3/.test(text)) {
+    return 'opencode-go'
+  }
+
+  if (/luna|sol|terra|codex|gpt-5|(^|\/)o[34]/.test(text)) {
+    return 'openai-codex'
+  }
+
+  return null
+}
+
+/** The most-used 5h window of a provider (worst case across its accounts);
+ * falls back to any window when none is labelled 5h. */
+function fiveHourWindow(provider) {
+  if (!provider) {
+    return null
+  }
+
+  const windows = (provider.accounts || []).flatMap(account => account.windows || [])
+  const fives = windows.filter(w => String(w.k || '').toLowerCase().includes('5h'))
+  const pool = fives.length ? fives : windows
+
+  return pool.length ? pool.reduce((worst, w) => (w.pct > worst.pct ? w : worst)) : null
+}
+
+function formatPct(pct) {
+  const value = Math.round(Number(pct) * 10) / 10
+
+  return Number.isInteger(value) ? String(value) : value.toFixed(1)
+}
+
 function QuotaChip() {
   const open = useValue($paneOpen)
+  const modelAtom = host.model || $modelFallback
+  const model = useValue(modelAtom)
+
+  const query = useQuery({
+    queryKey: QUERY_KEY,
+    queryFn: () => fetchQuotas(),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+    retry: 1
+  })
+
+  const providers = (query.data && query.data.providers) || []
+  let active = providers.find(provider => provider.id === providerForModel(model)) || null
+  let five = active ? fiveHourWindow(active) : null
+
+  if (!five) {
+    active = null
+
+    for (const provider of providers) {
+      const candidate = fiveHourWindow(provider)
+
+      if (candidate && (!five || candidate.pct > five.pct)) {
+        five = candidate
+        active = provider
+      }
+    }
+  }
+
+  const tag = (active && PROVIDER_TAGS[active.id]) || 'quota'
+  const value = five ? `${five.k} ${formatPct(five.pct)}%` : null
+  const icon = (active && PROVIDER_ICONS[active.id]) || 'pulse'
+  const tooltip = [
+    open ? 'Quota Dashboard — click to close' : 'Quota Dashboard — click to open',
+    model ? `session: ${model}` : null,
+    active ? `${active.name}${value ? ` · ${value}` : ''}` : null
+  ]
+    .filter(Boolean)
+    .join(' · ')
 
   return jsx(Tip, {
-    label: open ? 'Quota Dashboard — click to close the pane' : 'Quota Dashboard — click to open the pane',
-    children: jsx('button', {
+    label: tooltip,
+    children: jsxs('button', {
       type: 'button',
       className: cn(
         'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] transition-colors',
@@ -468,7 +578,10 @@ function QuotaChip() {
           : 'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
       ),
       onClick: togglePane,
-      children: 'quota'
+      children: [
+        jsx(Codicon, { name: icon, size: '0.75rem' }),
+        jsx('span', { className: 'tabular-nums', children: value ? `${tag} ${value}` : tag })
+      ]
     })
   })
 }

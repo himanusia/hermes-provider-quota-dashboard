@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """quota-dash probe - read-only quota readouts for Hermes credential pools.
 
-Enumerates every credential for openai-codex, opencode-go, and commandcode
-(Hermes credential pool rows + ~/.hermes/.env fallbacks), probes each
-provider's usage API in parallel, and prints exactly one machine-readable
-line:
+Ships with openai-codex, opencode-go, and commandcode (Hermes credential pool
+rows + ~/.hermes/.env fallbacks), probes each provider's usage API in
+parallel, and prints exactly one machine-readable line:
 
     @@QUOTA@@ {json}
 
@@ -15,6 +14,10 @@ Safety invariants:
 
 Run standalone:  python3 probe.py [--provider ID] [--account PROVIDER:FP]
 Overridable via env: HERMES_HOME, HERMES_AGENT_REPO.
+
+Adding another provider is a one-function change: write probe_<id>(account)
+-> row (contract in ROW_CONTRACT below) and register it in PROVIDERS. The
+desktop pane renders whatever the probe returns - no UI changes needed.
 """
 
 from __future__ import annotations
@@ -319,6 +322,28 @@ def probe_commandcode(account: dict) -> dict:
     return row
 
 
+ROW_CONTRACT = {"label": "?", "sub": "", "plan": None, "acct": None,
+                "windows": [], "notes": [], "error": None}
+
+
+def normalize_row(row) -> dict:
+    """Fill a probe row's defaults - a backstop so third-party probe functions
+    returning partial rows still render. Window entries:
+    {"k": str, "pct": float, "reset": iso|None, "note": str|None}."""
+    merged = dict(ROW_CONTRACT)
+    if isinstance(row, dict):
+        merged.update(row)
+    for key in ("windows", "notes"):
+        if not isinstance(merged.get(key), list):
+            merged[key] = []
+    return merged
+
+
+# To add a provider: write `def probe_<id>(account) -> row` (contract above,
+# guide in README "Adding another provider" - PRs welcome) and append one
+# entry here. `account` = {"label", "token", "base", "fp"}; set "env_var" to
+# the .env var supplying a fallback credential when the pool is empty ("" =
+# pool only).
 PROVIDERS = (
     {"id": "openai-codex", "name": "Codex (ChatGPT)", "env_var": "", "base": CODEX_DEFAULT_BASE,
      "probe": probe_codex},
@@ -382,7 +407,7 @@ def main() -> int:
                 "id": provider["id"],
                 "name": provider["name"],
                 "accounts": [
-                    {**results[(provider["id"], account["fp"])], "fp": account["fp"]}
+                    {**normalize_row(results.get((provider["id"], account["fp"]))), "fp": account["fp"]}
                     for account in per_provider[provider["id"]]
                 ],
             }

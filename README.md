@@ -19,12 +19,12 @@ in this screenshot.)*
 
 | Provider | Per-account readout |
 |---|---|
-| **OpenAI Codex** | every pool credential: plan, 5h session + weekly windows (% used, reset time), banked resets, credit balance, token expiry, and short credential/account fingerprints. Accounts that resolve to the same ChatGPT account are labelled `same account as …` |
+| **OpenAI Codex** | every pool credential: plan, 5h session + weekly windows (% used, reset time), banked resets, credit balance, token expiry, and short credential/account fingerprints. Credentials that resolve to the same account share one quota, so they collapse into a single card listing the credentials behind it |
 | **OpenCode Go** | rolling (5h) / weekly / monthly usage % of each window's cap, with reset times |
 | **CommandCode** | plan (GOAT / Pro / Max / Go / Teams), 5h and weekly windows ($ used / cap), monthly credit balance, renewal date, and the current billing period's request/token totals |
 
 Ways to open it: a **quota** chip in the status bar (toggles the pane open /
-closed; highlighted while the pane is on screen), a **Quota Dashboard** row in
+closed; highlighted while the pane is open), a **Quota Dashboard** row in
 the left sidebar (opens the full-page view), and ⌘K palette commands:
 **Quota: refresh dashboard**, **Quota: open in main workspace**,
 **Quota: open as page**, **Quota: hide pane**, **Quota: show pane**.
@@ -33,7 +33,9 @@ Refresh at three granularities: **Refresh all** in the pane header, a **↻ butt
 per provider**, and a **↻ button on every account card**. A per-provider or
 per-account refresh only re-probes that slice (`probe.py --provider <id>` /
 `probe.py --account <provider>:<fp>`), then merges the fresh numbers into the
-view — so you can re-check one Codex key without re-hitting the others.
+view — so you can re-check one Codex key without re-hitting the others. On a
+merged account card (several credentials sharing one account), ↻ re-probes
+every credential behind it.
 
 ## Install
 
@@ -90,6 +92,41 @@ gateway's `shell.exec` RPC, parses it, and renders the bars — refreshed every
 | Codex | `chatgpt.com/backend-api/wham/usage` (or `/api/codex/usage`) | ChatGPT OAuth token per pool entry |
 | OpenCode Go | `https://opencode.ai/zen/go/v1/usage` | `OPENCODE_GO_API_KEY` |
 | CommandCode | `https://api.commandcode.ai/alpha/{whoami,billing/credits,billing/subscriptions,usage/summary}` | `COMMANDCODE_API_KEY` |
+
+## Adding another provider
+
+Pull requests adding providers are welcome — the seam is one function.
+
+1. Write `probe_<id>(account) -> row` in `probe.py` next to the others.
+   `account` is `{"label", "token", "base", "fp"}` (pool rows first, `.env`
+   fallbacks second); return the row contract below.
+2. Append one entry to `PROVIDERS` (id, display name, env-var fallback,
+   default base URL, your probe function).
+3. Test standalone: `python3 probe.py --provider <id>` — expect a single
+   `@@QUOTA@@ {json}` line containing your provider's rows.
+
+Row contract (only `label` is required; `normalize_row` fills the rest):
+
+```python
+{
+  "label": "credential label",            # card title
+  "sub":   "fp a1b2c3 - extra detail",    # muted detail line
+  "plan":  "Plus",                        # badge, or None
+  "acct":  "a1b2c3",                      # account-id hash — rows with the
+                                          #   same value merge into one card
+  "windows": [                            # one labelled bar each
+    {"k": "5h", "pct": 42.0, "reset": "2026-09-12T23:26+07:00", "note": "$2 / $14"}
+  ],
+  "notes": ["any extra fact"],            # small muted lines
+  "error": None                           # string -> warning line
+}
+```
+
+The desktop pane renders whatever the probe returns — no UI changes needed.
+
+Rules: probes are read-only (never refresh tokens, never mutate the pool,
+never redeem credits), never print secrets (short SHA-256 fingerprints only),
+one row per credential — the UI collapses rows that share an `acct`.
 
 ## Security & safety
 

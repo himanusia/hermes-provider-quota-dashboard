@@ -34,8 +34,8 @@ build step. Drop it in the desktop plugin door and the app hot-loads it.
 | **OpenCode Go** | rolling (5h) / weekly / monthly usage % of each window's cap, with reset times |
 | **CommandCode** | plan (GOAT / Pro / Max / Go / Teams), 5h and weekly windows ($ used / cap), monthly credit balance, renewal date, and the current billing period's request/token totals |
 
-Plus two ⌘K palette commands: **Quota: refresh dashboard** and
-**Quota: open in main workspace**.
+Plus ⌘K palette commands: **Quota: refresh dashboard**, **Quota: open in main
+workspace**, **Quota: hide pane**, and **Quota: show pane**.
 
 Refresh at three granularities: **Refresh all** in the pane header, a **↻ button
 per provider**, and a **↻ button on every account card**. A per-provider or

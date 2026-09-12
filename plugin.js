@@ -496,12 +496,12 @@ function togglePane() {
   }
 }
 
-const $modelFallback = atom('')
-
 // --- statusbar chip: the live session's provider + its 5h limit ---------------
 
 const PROVIDER_LABELS = { 'openai-codex': 'Codex', 'opencode-go': 'OpenCode Go', commandcode: 'CommandCode' }
-const PROVIDER_ICONS = { 'openai-codex': 'sparkle', 'opencode-go': 'code', commandcode: 'terminal' }
+// One plugin icon, not per-provider glyphs: the chip is the dashboard's
+// toggle, so it wears the same codicon as the sidebar row and the page.
+const CHIP_ICON = 'dashboard'
 const PROVIDER_ALIASES = {
   'openai-codex': 'openai-codex',
   codex: 'openai-codex',
@@ -569,8 +569,30 @@ function formatPct(pct) {
 
 function QuotaChip() {
   const open = useValue($paneOpen)
-  const modelAtom = host.model || $modelFallback
-  const model = useValue(modelAtom)
+  const focusedRuntimeId = useValue(host.state.focusedSessionId)
+  const mainModel = useValue(host.state.model)
+
+  // Follow the FOCUSED chat, not the primary-only globals: the same
+  // `model.options` read the composer menu uses — the live agent owns its
+  // provider/model, so the chip tracks the user between tiles. Drafts and
+  // unspawned sessions answer with ''; the main model covers those.
+  const focusQuery = useQuery({
+    queryKey: ['quota-dash', 'focused', focusedRuntimeId, mainModel],
+    enabled: Boolean(focusedRuntimeId),
+    staleTime: 30_000,
+    retry: 1,
+    queryFn: async () => {
+      const res = await host.request('model.options', {
+        session_id: focusedRuntimeId,
+        explicit_only: true
+      })
+
+      return { model: String((res && res.model) || ''), provider: String((res && res.provider) || '') }
+    }
+  })
+
+  const focused = focusQuery.data || null
+  const model = (focused && focused.model) || mainModel || ''
 
   const query = useQuery({
     queryKey: QUERY_KEY,
@@ -581,7 +603,9 @@ function QuotaChip() {
   })
 
   const providers = (query.data && query.data.providers) || []
-  let active = providers.find(provider => provider.id === providerForModel(model)) || null
+  const providerId =
+    PROVIDER_ALIASES[String((focused && focused.provider) || '').toLowerCase()] || providerForModel(model)
+  let active = providers.find(provider => provider.id === providerId) || null
   let five = active ? fiveHourWindow(active) : null
 
   if (!five) {
@@ -599,7 +623,7 @@ function QuotaChip() {
 
   const label = (active && PROVIDER_LABELS[active.id]) || 'quota'
   const value = five ? `${five.k} ${formatPct(five.pct)}%` : null
-  const icon = (active && PROVIDER_ICONS[active.id]) || 'pulse'
+  const icon = CHIP_ICON
   const tooltip = [
     open ? 'Quota Dashboard — click to close' : 'Quota Dashboard — click to open',
     model ? `session: ${model}` : null,

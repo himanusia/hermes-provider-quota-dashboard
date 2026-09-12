@@ -24,10 +24,11 @@ screenshot.)*
 | **OpenCode Go** | rolling (5h) / weekly / monthly usage % of each window's cap, with reset times |
 | **CommandCode** | plan (GOAT / Pro / Max / Go / Teams), 5h and weekly windows ($ used / cap), monthly credit balance, renewal date, and the current billing period's request/token totals |
 
-Ways to open it: a **status-bar chip** that tracks the live session — it maps
-the session's model slug to a provider and shows that provider's 5h usage
-(e.g. `OpenCode Go 5h 6%`), and toggles the pane open / closed (highlighted while the
-pane is open); a
+Ways to open it: a **status-bar chip** that follows the FOCUSED chat — it reads
+the focused session's live provider/model (the same `model.options` read the
+composer menu uses) and shows that provider's 5h usage (e.g. `OpenCode Go 5h 6%`;
+a Codex-backed chat shows `Codex session (5h) 0%`) — and toggles the pane open /
+closed (highlighted while the pane is open); a
 **Quota Dashboard** row in
 the left sidebar (opens the full-page view), and ⌘K palette commands:
 **Quota: refresh dashboard**, **Quota: open in main workspace**,

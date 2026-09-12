@@ -404,10 +404,6 @@ let paneCtx = null
 let paneDisposer = null
 const $paneOpen = atom(true)
 
-function paneVisibleAtom() {
-  return typeof host.paneVisibility === 'function' ? host.paneVisibility(`${ID}:pane`) : $paneOpen
-}
-
 function showPane() {
   if (!paneDisposer && paneCtx) {
     paneDisposer = paneCtx.register(paneContribution())
@@ -427,31 +423,28 @@ function hidePane() {
 
 function togglePane() {
   haptic('tap')
-  const live = typeof host.paneVisibility === 'function' ? host.paneVisibility(`${ID}:pane`) : null
-  const visible = live ? live.get() : Boolean(paneDisposer)
 
-  if (paneDisposer && visible) {
+  // Deterministic toggle: registered → hide, else → show. (A visibility atom
+  // can read false while the pane is still registered — e.g. tabbed behind in
+  // its group — and an "already registered but not visible → resurface" branch
+  // on that reading turns the chip into a re-register loop that never hides.)
+  if (paneDisposer) {
     hidePane()
-  } else if (paneDisposer) {
-    // Registered but tabbed-behind / zone minimized: re-register so the app
-    // places it back on screen.
-    hidePane()
-    showPane()
   } else {
     showPane()
   }
 }
 
 function QuotaChip() {
-  const visible = useValue(paneVisibleAtom())
+  const open = useValue($paneOpen)
 
   return jsx(Tip, {
-    label: visible ? 'Quota Dashboard — click to close the pane' : 'Quota Dashboard — click to open the pane',
+    label: open ? 'Quota Dashboard — click to close the pane' : 'Quota Dashboard — click to open the pane',
     children: jsx('button', {
       type: 'button',
       className: cn(
         'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] transition-colors',
-        visible
+        open
           ? 'text-(--ui-accent)'
           : 'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
       ),

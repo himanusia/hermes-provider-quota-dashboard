@@ -1,9 +1,10 @@
-# quota-dash — Hermes Desktop plugin
+# Hermes Provider Quota Dashboard
 
-A **[Hermes Desktop](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk) plugin**
-that puts a live quota dashboard in a side pane: subscription limits for
-**OpenAI Codex**, **OpenCode Go**, and **CommandCode** — for *every* account in
-your Hermes credential pools, not just the one currently selected.
+**A [Hermes Desktop](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk) plugin**
+(`himanusia/hermes-provider-quota-dashboard`) that puts a live quota dashboard in
+a side pane: subscription limits for **OpenAI Codex**, **OpenCode Go**, and
+**CommandCode** — for *every* account in your Hermes credential pools, not just
+the one currently selected.
 
 Built with the Hermes Desktop Plugin SDK (`@hermes/plugin-sdk`) — plain ESM, no
 build step. Drop it in the desktop plugin door and the app hot-loads it.
@@ -36,14 +37,20 @@ build step. Drop it in the desktop plugin door and the app hot-loads it.
 Plus two ⌘K palette commands: **Quota: refresh dashboard** and
 **Quota: open in main workspace**.
 
+Refresh at three granularities: **Refresh all** in the pane header, a **↻ button
+per provider**, and a **↻ button on every account card**. A per-provider or
+per-account refresh only re-probes that slice (`probe.py --provider <id>` /
+`probe.py --account <provider>:<fp>`), then merges the fresh numbers into the
+view — so you can re-check one Codex key without re-hitting the others.
+
 ## Install
 
 Requires [Hermes Desktop](https://github.com/NousResearch/hermes-agent) with
 the desktop plugin door (`~/.hermes/desktop-plugins/`).
 
 ```bash
-git clone https://github.com/himanusia/quota-dash.git
-cd quota-dash
+git clone https://github.com/himanusia/hermes-provider-quota-dashboard.git
+cd hermes-provider-quota-dashboard
 ./install.sh
 ```
 

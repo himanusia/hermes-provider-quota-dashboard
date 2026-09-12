@@ -11,9 +11,10 @@ build step. Drop it in the desktop plugin door and the app hot-loads it.
 
 ![Quota Dashboard pane in Hermes Desktop](docs/screenshot.png)
 
-*The pane in a live Hermes Desktop session — every Codex credential in the pool,
-OpenCode Go, and CommandCode, each with its own refresh. (Account email redacted
-in this screenshot.)*
+*The pane in a live Hermes Desktop session — the Codex card folds the pool's
+credentials that share one account into a single readout, next to OpenCode Go
+and CommandCode, each with its own refresh. (Account email redacted in this
+screenshot.)*
 
 ## What it shows
 

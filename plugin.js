@@ -36,17 +36,18 @@ import {
   useQuery,
   useValue
 } from '@hermes/plugin-sdk'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'quota-dash'
 const QUERY_KEY = ['quota-dash', 'quotas']
 const SENTINEL = '@@QUOTA@@'
 
-// Runs on the backend host. Edit the paths here if you installed elsewhere;
-// `HERMES_PYTHON` / `HERMES_QUOTA_PROBE` env vars on the backend override them.
+// Runs on the backend host. Backend env can override every path:
+// HERMES_PYTHON (python), HERMES_QUOTA_PROBE (probe script), HERMES_HOME
+// (default root); the defaults target a standard ~/.hermes install.
 const PROBE_CMD =
-  '/usr/bin/env -u PYTHONPATH "$HOME/.hermes/hermes-agent/venv/bin/python" "$HOME/.hermes/desktop-plugins/quota-dash/probe.py"'
+  '/usr/bin/env -u PYTHONPATH "${HERMES_PYTHON:-$HOME/.hermes/hermes-agent/venv/bin/python}" "${HERMES_QUOTA_PROBE:-${HERMES_HOME:-$HOME/.hermes}/desktop-plugins/quota-dash/probe.py}"'
 
 function buildProbeCommand({ provider, account } = {}) {
   let cmd = PROBE_CMD
@@ -255,6 +256,15 @@ function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRe
 function QuotaPane() {
   const [busyProviders, setBusyProviders] = useState({})
   const [busyAccounts, setBusyAccounts] = useState({})
+  // Per-scope refresh generations: a slow in-flight response must never
+  // clobber a newer refresh's result (last click wins).
+  const refreshSeq = useRef({})
+  const beginRefresh = scope => {
+    const token = (refreshSeq.current[scope] || 0) + 1
+    refreshSeq.current[scope] = token
+    return token
+  }
+  const isCurrent = (scope, token) => refreshSeq.current[scope] === token
 
   const query = useQuery({
     queryKey: QUERY_KEY,
@@ -274,9 +284,15 @@ function QuotaPane() {
 
   const refreshProvider = providerId => {
     haptic('tap')
+    const scope = `provider:${providerId}`
+    const token = beginRefresh(scope)
     setBusyProviders(previous => ({ ...previous, [providerId]: true }))
     fetchQuotas({ provider: providerId })
       .then(payload => {
+        if (!isCurrent(scope, token)) {
+          return
+        }
+
         const fresh = (payload.providers || [])[0]
 
         if (!fresh) {
@@ -285,16 +301,30 @@ function QuotaPane() {
 
         queryClient.setQueryData(QUERY_KEY, previous => mergeProvider(previous, fresh))
       })
-      .catch(failure)
-      .finally(() => setBusyProviders(previous => ({ ...previous, [providerId]: false })))
+      .catch(err => {
+        if (isCurrent(scope, token)) {
+          failure(err)
+        }
+      })
+      .finally(() => {
+        if (isCurrent(scope, token)) {
+          setBusyProviders(previous => ({ ...previous, [providerId]: false }))
+        }
+      })
   }
 
   const refreshAccount = (providerId, fp, label) => {
     haptic('tap')
     const key = `${providerId}:${fp}`
+    const scope = `account:${key}`
+    const token = beginRefresh(scope)
     setBusyAccounts(previous => ({ ...previous, [key]: true }))
     fetchQuotas({ account: key })
       .then(payload => {
+        if (!isCurrent(scope, token)) {
+          return
+        }
+
         const fresh = (payload.providers || [])[0] && (payload.providers[0].accounts || [])[0]
 
         if (!fresh || !fresh.fp) {
@@ -324,8 +354,16 @@ function QuotaPane() {
           }
         })
       })
-      .catch(failure)
-      .finally(() => setBusyAccounts(previous => ({ ...previous, [key]: false })))
+      .catch(err => {
+        if (isCurrent(scope, token)) {
+          failure(err)
+        }
+      })
+      .finally(() => {
+        if (isCurrent(scope, token)) {
+          setBusyAccounts(previous => ({ ...previous, [key]: false }))
+        }
+      })
   }
 
   const fetchedAt = query.data && query.data.fetchedAt ? new Date(query.data.fetchedAt) : null

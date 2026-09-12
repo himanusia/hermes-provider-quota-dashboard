@@ -167,7 +167,8 @@ re-verify anytime with the standalone probe above.
   still shows which one.
 - The pane needs the backend host to have the Hermes venv
   (`~/.hermes/hermes-agent/venv`) and `~/.hermes/.env` in the usual place.
-  Edit `PROBE_CMD` in `plugin.js` if your install differs.
+  Set `HERMES_PYTHON` / `HERMES_QUOTA_PROBE` / `HERMES_HOME` in the backend
+  environment (or edit `PROBE_CMD` in `plugin.js`) if your install differs.
 
 ## License
 

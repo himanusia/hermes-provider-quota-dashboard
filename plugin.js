@@ -500,7 +500,7 @@ const $modelFallback = atom('')
 
 // --- statusbar chip: the live session's provider + its 5h limit ---------------
 
-const PROVIDER_TAGS = { 'openai-codex': 'CX', 'opencode-go': 'OG', commandcode: 'CC' }
+const PROVIDER_LABELS = { 'openai-codex': 'Codex', 'opencode-go': 'OpenCode Go', commandcode: 'CommandCode' }
 const PROVIDER_ICONS = { 'openai-codex': 'sparkle', 'opencode-go': 'code', commandcode: 'terminal' }
 const PROVIDER_ALIASES = {
   'openai-codex': 'openai-codex',
@@ -518,7 +518,7 @@ const PROVIDER_ALIASES = {
 /** Best-effort map from a model slug (`host.model`) to one of the quota
  * providers. Provider-prefixed slugs ("opencode-go/…") resolve exactly; bare
  * slugs use a small keyword table. Unmapped → null; the chip then falls back
- * to the tightest 5h window across all providers, tag included. */
+ * to the tightest 5h window across all providers, label included. */
 function providerForModel(slug) {
   const text = String(slug || '').toLowerCase().trim()
 
@@ -597,7 +597,7 @@ function QuotaChip() {
     }
   }
 
-  const tag = (active && PROVIDER_TAGS[active.id]) || 'quota'
+  const label = (active && PROVIDER_LABELS[active.id]) || 'quota'
   const value = five ? `${five.k} ${formatPct(five.pct)}%` : null
   const icon = (active && PROVIDER_ICONS[active.id]) || 'pulse'
   const tooltip = [
@@ -621,7 +621,7 @@ function QuotaChip() {
       onClick: togglePane,
       children: [
         jsx(Codicon, { name: icon, size: '0.75rem' }),
-        jsx('span', { className: 'tabular-nums', children: value ? `${tag} ${value}` : tag })
+        jsx('span', { className: 'tabular-nums', children: value ? `${label} ${value}` : label })
       ]
     })
   })

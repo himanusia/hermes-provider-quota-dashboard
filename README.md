@@ -26,7 +26,7 @@ screenshot.)*
 
 Ways to open it: a **status-bar chip** that tracks the live session — it maps
 the session's model slug to a provider and shows that provider's 5h usage
-(e.g. `OG 5h 6%`), and toggles the pane open / closed (highlighted while the
+(e.g. `OpenCode Go 5h 6%`), and toggles the pane open / closed (highlighted while the
 pane is open); a
 **Quota Dashboard** row in
 the left sidebar (opens the full-page view), and ⌘K palette commands:

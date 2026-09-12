@@ -636,11 +636,11 @@ function QuotaChip() {
     label: tooltip,
     children: jsxs('button', {
       type: 'button',
+      // Match the app's standard statusbar action chrome (STATUSBAR_ACTION_CLASS):
+      // one muted tone with hover states — the accent glow is the update pill's
+      // colour, not a readout's.
       className: cn(
-        'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] transition-colors',
-        open
-          ? 'text-(--ui-accent)'
-          : 'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
+        'inline-flex h-full items-center gap-1 rounded-none px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground'
       ),
       onClick: togglePane,
       children: [

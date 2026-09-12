@@ -101,15 +101,12 @@ gateway's `shell.exec` RPC, parses it, and renders the bars — refreshed every
 - **No credentials in this repo.** Keys are read at runtime from the Hermes
   credential pool / `~/.hermes/.env` on your machine.
 
-## Verified
+## Status
 
-Live-verified 2026-09-12 on macOS (Hermes Desktop, local backend):
-
-- **Codex** — 3 pool entries probed, all HTTP 200; the three entries resolve to
-  the *same* ChatGPT account and the pane labels the duplicates.
-- **OpenCode Go** — rolling/weekly/monthly windows returned and rendered.
-- **CommandCode** — GOAT plan: 5h + weekly windows, credit balance, period
-  totals returned and rendered.
+End-to-end verified **2026-09-12** on macOS (Hermes Desktop, local backend):
+every Codex pool entry, OpenCode Go's windows, and CommandCode's GOAT plan all
+returned and rendered in the pane. It is a dated check, not a permanent claim —
+re-verify anytime with the standalone probe above.
 
 ## Limitations
 

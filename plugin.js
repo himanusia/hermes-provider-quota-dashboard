@@ -22,11 +22,18 @@ import {
   Button,
   GlyphSpinner,
   PALETTE_AREA,
+  ROUTES_AREA,
+  SIDEBAR_NAV_AREA,
   Skeleton,
+  STATUSBAR_AREAS,
+  Tip,
+  atom,
+  cn,
   haptic,
   host,
   queryClient,
-  useQuery
+  useQuery,
+  useValue
 } from '@hermes/plugin-sdk'
 import { useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -391,11 +398,106 @@ function paneContribution() {
   }
 }
 
+// Pane registration state at module scope so the statusbar chip, the palette
+// commands, and the plugin lifecycle all drive the same toggle.
+let paneCtx = null
+let paneDisposer = null
+const $paneOpen = atom(true)
+
+function paneVisibleAtom() {
+  return typeof host.paneVisibility === 'function' ? host.paneVisibility(`${ID}:pane`) : $paneOpen
+}
+
+function showPane() {
+  if (!paneDisposer && paneCtx) {
+    paneDisposer = paneCtx.register(paneContribution())
+  }
+
+  $paneOpen.set(true)
+}
+
+function hidePane() {
+  if (paneDisposer) {
+    paneDisposer()
+    paneDisposer = null
+  }
+
+  $paneOpen.set(false)
+}
+
+function togglePane() {
+  haptic('tap')
+  const live = typeof host.paneVisibility === 'function' ? host.paneVisibility(`${ID}:pane`) : null
+  const visible = live ? live.get() : Boolean(paneDisposer)
+
+  if (paneDisposer && visible) {
+    hidePane()
+  } else if (paneDisposer) {
+    // Registered but tabbed-behind / zone minimized: re-register so the app
+    // places it back on screen.
+    hidePane()
+    showPane()
+  } else {
+    showPane()
+  }
+}
+
+function QuotaChip() {
+  const visible = useValue(paneVisibleAtom())
+
+  return jsx(Tip, {
+    label: visible ? 'Quota Dashboard — click to close the pane' : 'Quota Dashboard — click to open the pane',
+    children: jsx('button', {
+      type: 'button',
+      className: cn(
+        'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] transition-colors',
+        visible
+          ? 'text-(--ui-accent)'
+          : 'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
+      ),
+      onClick: togglePane,
+      children: 'quota'
+    })
+  })
+}
+
+function QuotaPage() {
+  return jsx('div', {
+    className: 'h-full overflow-y-auto',
+    children: jsx('div', {
+      className: 'mx-auto flex w-full max-w-3xl flex-col p-4',
+      children: jsx(QuotaPane, {})
+    })
+  })
+}
+
 export default {
   id: ID,
   name: 'Provider Quota Dashboard',
   register(ctx) {
-    let paneDisposer = ctx.register(paneContribution())
+    paneCtx = ctx
+    paneDisposer = ctx.register(paneContribution())
+    $paneOpen.set(true)
+
+    ctx.registerMany([
+      {
+        id: 'chip',
+        area: STATUSBAR_AREAS.right,
+        order: 10,
+        render: () => jsx(QuotaChip, {})
+      },
+      {
+        id: 'page',
+        area: ROUTES_AREA,
+        data: { path: '/quota-dashboard' },
+        render: () => jsx(QuotaPage, {})
+      },
+      {
+        id: 'nav',
+        area: SIDEBAR_NAV_AREA,
+        data: { path: '/quota-dashboard', label: 'Quota Dashboard', codicon: 'dashboard' }
+      }
+    ])
 
     ctx.register({
       id: 'refresh',
@@ -441,9 +543,8 @@ export default {
         keywords: ['quota', 'hide', 'close', 'pane'],
         run: () => {
           if (paneDisposer) {
-            paneDisposer()
-            paneDisposer = null
-            host.notify({ kind: 'info', message: 'Quota pane hidden — restore with ⌘K "Quota: show pane".' })
+            hidePane()
+            host.notify({ kind: 'info', message: 'Quota pane hidden — restore from the statusbar "quota" chip or ⌘K "Quota: show pane".' })
           }
         }
       }
@@ -457,11 +558,20 @@ export default {
         label: 'Quota: show pane',
         keywords: ['quota', 'show', 'open', 'pane'],
         run: () => {
-          if (!paneDisposer) {
-            paneDisposer = ctx.register(paneContribution())
-            host.notify({ kind: 'info', message: 'Quota pane restored.' })
-          }
+          showPane()
+          host.notify({ kind: 'info', message: 'Quota pane restored.' })
         }
+      }
+    })
+
+    ctx.register({
+      id: 'page-open',
+      area: PALETTE_AREA,
+      data: {
+        id: 'quota-dash.page',
+        label: 'Quota: open as page',
+        keywords: ['quota', 'page', 'dashboard', 'open'],
+        run: () => host.navigate('/quota-dashboard')
       }
     })
   }

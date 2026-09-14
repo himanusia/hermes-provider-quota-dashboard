@@ -62,7 +62,16 @@ function buildProbeCommand({ provider, account } = {}) {
 }
 
 async function fetchQuotas(filters) {
-  const result = await host.request('shell.exec', { command: buildProbeCommand(filters) })
+  // A booting backend can leave the request hanging (not just rejecting);
+  // bound it so a stuck fetch becomes a retryable failure, never an eternal
+  // skeleton that only a manual refresh clears.
+  let timer = null
+  const result = await Promise.race([
+    host.request('shell.exec', { command: buildProbeCommand(filters) }),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('quota probe timed out (60s)')), 60_000)
+    })
+  ]).finally(() => clearTimeout(timer))
   const stdout = String((result && result.stdout) || '')
   const marker = stdout.lastIndexOf(SENTINEL)
 
@@ -266,12 +275,18 @@ function QuotaPane() {
   }
   const isCurrent = (scope, token) => refreshSeq.current[scope] === token
 
+  // A fresh app open must load itself: hold the first fetch until the gateway
+  // socket is open (shell.exec would just burn a failure during backend boot),
+  // then heal fast after any failure instead of waiting a full minute.
+  const gatewayReady = useValue(host.state.gateway) === 'open'
   const query = useQuery({
     queryKey: QUERY_KEY,
     queryFn: () => fetchQuotas(),
-    refetchInterval: 60_000,
+    enabled: gatewayReady,
+    refetchInterval: q => (q.state.error ? 15_000 : 60_000),
     staleTime: 30_000,
-    retry: 1
+    retry: 3,
+    retryDelay: attempt => Math.min(1_000 * 2 ** attempt, 10_000)
   })
 
   const failure = err =>
@@ -567,6 +582,7 @@ function QuotaChip() {
   const open = useValue($paneOpen)
   const focusedRuntimeId = useValue(host.state.focusedSessionId)
   const mainModel = useValue(host.state.model)
+  const gatewayReady = useValue(host.state.gateway) === 'open'
 
   // Follow the FOCUSED chat, not the primary-only globals: the same
   // `model.options` read the composer menu uses — the live agent owns its
@@ -574,7 +590,7 @@ function QuotaChip() {
   // unspawned sessions answer with ''; the main model covers those.
   const focusQuery = useQuery({
     queryKey: ['quota-dash', 'focused', focusedRuntimeId, mainModel],
-    enabled: Boolean(focusedRuntimeId),
+    enabled: Boolean(focusedRuntimeId) && gatewayReady,
     staleTime: 30_000,
     retry: 1,
     queryFn: async () => {
@@ -593,9 +609,11 @@ function QuotaChip() {
   const query = useQuery({
     queryKey: QUERY_KEY,
     queryFn: () => fetchQuotas(),
-    refetchInterval: 60_000,
+    enabled: gatewayReady,
+    refetchInterval: q => (q.state.error ? 15_000 : 60_000),
     staleTime: 30_000,
-    retry: 1
+    retry: 3,
+    retryDelay: attempt => Math.min(1_000 * 2 ** attempt, 10_000)
   })
 
   const providers = (query.data && query.data.providers) || []

@@ -438,11 +438,7 @@ function QuotaPane() {
                     },
                     provider.id
                   )
-                ),
-                jsx('div', {
-                  className: 'text-[0.65rem] text-(--ui-text-quaternary)',
-                  children: 'read-only probe · ↻ per provider/account · secrets never leave the host'
-                })
+                )
               ]
             })
     ]

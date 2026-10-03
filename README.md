@@ -23,6 +23,7 @@ screenshot.)*
 | **OpenAI Codex** | every pool credential: plan, 5h session + weekly windows (% used, reset time), banked resets, credit balance, token expiry, and short credential/account fingerprints. Credentials that resolve to the same account share one quota, so they collapse into a single card listing the credentials behind it |
 | **OpenCode Go** | rolling (5h) / weekly / monthly usage % of each window's cap, with reset times |
 | **CommandCode** | plan (GOAT / Pro / Max / Go / Teams), 5h + weekly rate-limit windows ($ used / cap) and the monthly cycle budget (spend / plan total, reset at cycle end), remaining credit balance, cycle end date, and the current billing period's request/token totals |
+| **Claude subscription** | Claude Pro/Max via Claude Code's own login (what `claude-subscription-directsdk-experimental` drives): plan, 5h session + weekly windows (% used, reset time), per-model weekly caps when the plan has them, extra-usage monthly spend when enabled, and the weekly surface mix |
 | **OmniRoute** | local SQLite metadata and local usage history: configured route aliases (including `coding-safe`), stored model order, local request/token totals, and configured-connection counts |
 | **9router** | local SQLite metadata and local usage history: observed models, local request/token totals, and configured-connection counts; the local database currently has no combo rows |
 
@@ -34,7 +35,12 @@ closed (highlighted while the pane is open); a
 **Quota Dashboard** row in
 the left sidebar (opens the full-page view), and ⌘K palette commands:
 **Quota: refresh dashboard**, **Quota: open in main workspace**,
-**Quota: open as page**, **Quota: hide pane**, **Quota: show pane**.
+**Quota: open as page**, **Quota: hide pane**, **Quota: show pane**,
+**Quota: show/hide &lt;provider&gt;**, **Quota: toggle statusbar chip**.
+
+Choose what it shows with **⚙** in the pane header: one switch per provider
+and local router, plus the statusbar chip, plan badges, and account notes.
+Choices persist per profile; a hidden provider or router is not probed at all.
 
 Refresh at three granularities: **Refresh all** in the pane header, a **↻ button
 per provider**, and a **↻ button on every account card**. A per-provider or
@@ -149,6 +155,7 @@ full router details before rendering.
 | Codex | `chatgpt.com/backend-api/wham/usage` (or `/api/codex/usage`) | ChatGPT OAuth token per pool entry |
 | OpenCode Go | `https://opencode.ai/zen/go/v1/usage` | `OPENCODE_GO_API_KEY` |
 | CommandCode | `https://api.commandcode.ai/alpha/{whoami,billing/credits,billing/subscriptions,usage/summary}` | `COMMANDCODE_API_KEY` |
+| Claude subscription | `https://api.anthropic.com/api/oauth/usage` (`anthropic-beta: oauth-2025-04-20`) | Claude Code's OAuth login: `CLAUDE_CODE_OAUTH_TOKEN`, else the macOS Keychain item `Claude Code-credentials`, else `.credentials.json` under `CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR` / `CLAUDE_CONFIG_DIR` / `~/.claude` |
 
 ## Adding another provider
 
@@ -222,6 +229,9 @@ re-verify anytime with the standalone probe above.
   (use the account, or re-auth, then refresh the pane).
 - CommandCode support uses the same `/alpha/…` endpoints its own CLI uses for
   `/usage` — undocumented, and may change without notice.
+- Claude subscription usage comes from `/api/oauth/usage`, the endpoint Claude
+  Code's own `/usage` reads — undocumented. The probe never refreshes the OAuth
+  token: an expired one is reported, and the next Claude turn refreshes it.
 - CommandCode publishes no monthly *rate-limit* window: `windowLimits` carries
   only the 5h and weekly caps. The monthly figure is a **$ credit budget**
   spread over three endpoints — the plan total from

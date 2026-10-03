@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -50,6 +51,7 @@ TIMEOUT = 15.0
 CODEX_DEFAULT_BASE = "https://chatgpt.com/backend-api/codex"
 OPENCODE_DEFAULT_BASE = "https://opencode.ai/zen/go/v1"
 COMMANDCODE_DEFAULT_BASE = "https://api.commandcode.ai"
+CLAUDE_DEFAULT_BASE = "https://api.anthropic.com"
 
 # Router sections intentionally inspect only local SQLite state. They never
 # call the router HTTP API, provider endpoints, or a router CLI command.
@@ -1006,6 +1008,149 @@ def probe_commandcode(account: dict) -> dict:
     return row
 
 
+CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _claude_oauth_from(raw: str):
+    """{'accessToken', 'expiresAt', 'subscriptionType', 'rateLimitTier'} or None."""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if isinstance(oauth, dict) and oauth.get("accessToken"):
+        return oauth
+    return None
+
+
+def claude_accounts() -> list:
+    """Claude Code's OAuth login, read-only — never refreshed, never written.
+
+    Sources, first hit per token wins: CLAUDE_CODE_OAUTH_TOKEN (`claude
+    setup-token`), the macOS Keychain item Claude Code writes, then
+    `.credentials.json` under CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR /
+    CLAUDE_CONFIG_DIR / ~/.claude (Linux and custom config dirs)."""
+    found = []
+    env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or ENV.get("CLAUDE_CODE_OAUTH_TOKEN") or ""
+    if env_token:
+        found.append(("CLAUDE_CODE_OAUTH_TOKEN (env)", {"accessToken": env_token}))
+    if sys.platform == "darwin" and not os.environ.get("HERMES_QUOTA_NO_KEYCHAIN"):
+        try:
+            out = subprocess.run(
+                ["security", "find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"],
+                capture_output=True, text=True, timeout=10,
+            )
+            oauth = _claude_oauth_from(out.stdout.strip()) if out.returncode == 0 else None
+            if oauth:
+                found.append(("Claude Code login (keychain)", oauth))
+        except Exception:
+            pass
+    dirs = []
+    for name in ("CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR", "CLAUDE_CONFIG_DIR"):
+        value = os.environ.get(name) or ENV.get(name)
+        if value:
+            dirs.append(os.path.expanduser(value))
+    dirs.append(os.path.join(HOME, ".claude"))
+    for directory in dirs:
+        path = os.path.join(directory, ".credentials.json")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                oauth = _claude_oauth_from(handle.read())
+        except Exception:
+            oauth = None
+        if oauth:
+            found.append((f"Claude Code login ({display_path(directory)})", oauth))
+
+    seen: set = set()
+    accounts = []
+    for label, oauth in found:
+        token = str(oauth.get("accessToken") or "")
+        fp = sha(token)[:12]
+        if fp in seen:
+            continue
+        seen.add(fp)
+        accounts.append({"label": label, "token": token, "base": CLAUDE_DEFAULT_BASE, "fp": fp,
+                         "plan": oauth.get("subscriptionType"), "tier": oauth.get("rateLimitTier"),
+                         "expires": oauth.get("expiresAt")})
+    return accounts
+
+
+# Per-model / per-surface weekly caps the usage endpoint reports when the plan
+# has them (null otherwise). Unlisted codenamed keys are skipped, not guessed.
+CLAUDE_WINDOWS = (
+    ("five_hour", "session (5h)"),
+    ("seven_day", "weekly"),
+    ("seven_day_opus", "weekly opus"),
+    ("seven_day_sonnet", "weekly sonnet"),
+    ("seven_day_oauth_apps", "weekly oauth apps"),
+)
+
+
+def probe_claude(account: dict) -> dict:
+    token = account["token"]
+    base = (account.get("base") or CLAUDE_DEFAULT_BASE).rstrip("/")
+    bits = [f"fp {sha(token)[:6]}"]
+    if account.get("tier"):
+        bits.append(str(account["tier"]).replace("_", " "))
+    expires = account.get("expires")
+    if isinstance(expires, (int, float)) and expires > 0:
+        bits.append("token exp " + datetime.fromtimestamp(expires / 1000).strftime("%d %b %H:%M"))
+    plan = str(account.get("plan") or "").strip()
+    row = {"label": account["label"], "sub": " - ".join(bits), "plan": plan.title() if plan else None,
+           "windows": [], "notes": [], "error": None}
+    if isinstance(expires, (int, float)) and expires and expires / 1000 < time.time():
+        # Refreshing would mutate Claude Code's credential store: not ours to do.
+        row["error"] = "token expired; run any Claude Code / Hermes Claude turn to refresh it"
+        return row
+    headers = {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
+               "Accept": "application/json", "User-Agent": "claude-code"}
+    try:
+        response = httpx.get(base + "/api/oauth/usage", headers=headers, timeout=TIMEOUT)
+        if response.status_code == 200:
+            data = response.json() or {}
+            for key, label in CLAUDE_WINDOWS:
+                window = data.get(key)
+                if not isinstance(window, dict):
+                    continue
+                used = window.get("utilization")
+                if isinstance(used, (int, float)):
+                    entry = {"k": label, "pct": float(used), "reset": local_iso(window.get("resets_at"))}
+                    if window.get("locked_reason"):
+                        entry["note"] = f"locked: {safe_text(window['locked_reason'], 40)}"
+                    row["windows"].append(entry)
+            extra = data.get("extra_usage") or {}
+            if extra.get("is_enabled"):
+                limit, spent = extra.get("monthly_limit"), extra.get("used_credits")
+                places = extra.get("decimal_places")
+                scale = 10 ** places if isinstance(places, int) else 1
+                currency = str(extra.get("currency") or "").upper()
+                if isinstance(limit, (int, float)) and limit > 0 and isinstance(spent, (int, float)):
+                    row["windows"].append({
+                        "k": "extra usage (monthly)",
+                        "pct": round(float(spent) / float(limit) * 100, 1),
+                        "reset": None,
+                        "note": f"{spent / scale:.2f} / {limit / scale:.0f} {currency}".strip(),
+                    })
+                else:
+                    row["notes"].append("extra usage: on (no monthly cap reported)")
+                if extra.get("spend_limit_reached"):
+                    row["notes"].append("extra usage: spend limit reached")
+            breakdown = (data.get("seven_day_breakdown") or {}).get("rows") or []
+            parts = [f"{safe_text(r.get('display_name'), 24)} {safe_int(r.get('percent'))}%"
+                     for r in breakdown if isinstance(r, dict) and safe_int(r.get("percent")) > 0]
+            if parts:
+                row["notes"].append("weekly mix: " + ", ".join(parts))
+        elif response.status_code in (401, 403):
+            row["error"] = f"HTTP {response.status_code} - login rejected; re-run `claude auth login`"
+        elif response.status_code == 429:
+            row["error"] = "HTTP 429 - usage endpoint rate-limited; retry in a minute"
+        else:
+            row["error"] = f"HTTP {response.status_code}"
+    except Exception as exc:
+        row["error"] = f"{type(exc).__name__}: {str(exc)[:80]}"
+    return row
+
+
 ROW_CONTRACT = {"label": "?", "sub": "", "plan": None, "acct": None,
                 "windows": [], "notes": [], "error": None}
 
@@ -1035,6 +1180,11 @@ PROVIDERS = (
      "base": OPENCODE_DEFAULT_BASE, "probe": probe_opencode},
     {"id": "commandcode", "name": "CommandCode", "env_var": "COMMANDCODE_API_KEY",
      "base": COMMANDCODE_DEFAULT_BASE, "probe": probe_commandcode},
+    # Claude Pro/Max via Claude Code's own OAuth login (the account the
+    # claude-subscription-directsdk-experimental provider drives). Not a pool
+    # provider: "accounts" overrides the pool/env lookup.
+    {"id": "claude-subscription", "name": "Claude (subscription)", "env_var": "",
+     "base": CLAUDE_DEFAULT_BASE, "probe": probe_claude, "accounts": claude_accounts},
 )
 
 
@@ -1074,7 +1224,8 @@ def main() -> int:
             continue
         if wanted and pid not in wanted:
             continue
-        accounts = accounts_for(pid, provider["env_var"], provider["base"])
+        resolver = provider.get("accounts")
+        accounts = resolver() if resolver else accounts_for(pid, provider["env_var"], provider["base"])
         if pid in account_filters:
             prefixes = account_filters[pid]
             accounts = [a for a in accounts if any(a["fp"].startswith(p) for p in prefixes)]

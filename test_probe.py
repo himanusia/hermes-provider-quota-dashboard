@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import hashlib
 import io
@@ -394,6 +395,16 @@ class CommandCodeProbeTests(unittest.TestCase):
 
 
 class ClaudeSubscriptionProbeTests(unittest.TestCase):
+    def setUp(self):
+        # Never touch the real ~/.hermes/cache snapshot store.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.snap = patch.object(probe, "SNAPSHOT_DIR", self.tmp.name)
+        self.snap.start()
+
+    def tearDown(self):
+        self.snap.stop()
+        self.tmp.cleanup()
+
     class Response:
         def __init__(self, status_code, payload):
             self.status_code = status_code
@@ -488,6 +499,115 @@ class ClaudeSubscriptionProbeTests(unittest.TestCase):
         self.assertIn("'claude-subscription-directsdk-experimental': 'claude-subscription'", source)
         self.assertIn("ctx.storage.get(PREFS_KEY", source)
         self.assertIn("enabledIds(PROVIDER_IDS)", source)
+
+
+class SnapshotAndAntigravityTests(unittest.TestCase):
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.patches = [patch.object(probe, "SNAPSHOT_DIR", self.tmp.name),
+                        patch.object(probe, "SNAPSHOT_MIN_INTERVAL", 180)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def claude_account(self):
+        return {"label": "Claude", "token": "sample-oauth-token", "base": "", "fp": "deadbeef0000",
+                "plan": "pro", "expires": (time.time() + 3600) * 1000}
+
+    def test_a_429_falls_back_to_the_last_reading_labelled_with_its_age(self):
+        good = {"five_hour": {"utilization": 30.0, "resets_at": "2026-10-03T13:49:59+00:00"},
+                "seven_day": {"utilization": 4.0}}
+        with patch.object(probe.httpx, "get", lambda *a, **k: self.Response(200, good)):
+            first = probe.probe_claude(self.claude_account())
+        self.assertEqual([w["pct"] for w in first["windows"]], [30.0, 4.0])
+        path = probe._snapshot_path("claude-subscription", "deadbeef0000")
+        data = json.loads(Path(path).read_text())
+        data["at"] -= 600  # stale: forces a live request
+        Path(path).write_text(json.dumps(data))
+        self.assertNotIn("sample-oauth-token", Path(path).read_text())
+        with patch.object(probe.httpx, "get", lambda *a, **k: self.Response(429, {})):
+            row = probe.probe_claude(self.claude_account())
+        self.assertIsNone(row["error"])
+        self.assertEqual([w["pct"] for w in row["windows"]], [30.0, 4.0])
+        self.assertTrue(row["notes"][0].startswith("last reading "), row["notes"])
+        self.assertIn("HTTP 429", row["notes"][0])
+
+    def test_a_fresh_snapshot_serves_without_a_request(self):
+        good = {"five_hour": {"utilization": 30.0}, "seven_day": {"utilization": 4.0}}
+        with patch.object(probe.httpx, "get", lambda *a, **k: self.Response(200, good)):
+            probe.probe_claude(self.claude_account())
+        calls = []
+        with patch.object(probe.httpx, "get", lambda *a, **k: calls.append(a)):
+            row = probe.probe_claude(self.claude_account())
+        self.assertEqual(calls, [])
+        self.assertEqual([w["pct"] for w in row["windows"]], [30.0, 4.0])
+
+    def test_a_429_without_any_reading_stays_an_error(self):
+        with patch.object(probe.httpx, "get", lambda *a, **k: self.Response(429, {})):
+            row = probe.probe_claude(self.claude_account())
+        self.assertIn("HTTP 429", row["error"])
+
+    def test_antigravity_pools_models_by_family(self):
+        models = {"models": {
+            "claude-opus-4-6-thinking": {"displayName": "Claude Opus 4.6 (Thinking)",
+                                         "quotaInfo": {"remainingFraction": 0.6, "resetTime": "2026-10-03T16:16:20Z"}},
+            "claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6 (Thinking)",
+                                  "quotaInfo": {"remainingFraction": 0.9}},
+            "gemini-3.1-pro-high": {"displayName": "Gemini 3.1 Pro (High)", "quotaInfo": {"remainingFraction": 1}},
+            "gemini-3-flash": {"displayName": "Gemini 3 Flash", "quotaInfo": {"remainingFraction": 0.75}},
+            "tab_flash_lite_preview": {"quotaInfo": {"remainingFraction": 0}},
+        }}
+        load = {"paidTier": {"name": "Google AI Pro"}, "cloudaicompanionProject": "p-1"}
+
+        def post(url, headers=None, json=None, timeout=None):
+            return self.Response(200, load if url.endswith(":loadCodeAssist") else models)
+
+        account = {"label": "agy", "token": "agy-token", "base": "", "fp": "cafe00000000",
+                   "expires": "2099-01-01T00:00:00+00:00"}
+        with patch.object(probe.httpx, "post", post):
+            row = probe.probe_antigravity(account)
+        self.assertIsNone(row["error"])
+        self.assertEqual(row["plan"], "Google AI Pro")
+        self.assertEqual([(w["k"], w["pct"]) for w in row["windows"]],
+                         [("Claude models", 40.0), ("Gemini Pro", 0.0), ("Gemini Flash", 25.0)])
+        self.assertNotIn("agy-token", json.dumps(row))
+
+    def test_antigravity_expired_token_is_never_refreshed(self):
+        calls = []
+        with patch.object(probe.httpx, "post", lambda *a, **k: calls.append(a)):
+            row = probe.probe_antigravity({"label": "agy", "token": "t", "base": "", "fp": "beef00000000",
+                                           "expires": "2000-01-01T00:00:00+00:00"})
+        self.assertEqual(calls, [])
+        self.assertIn("expired", row["error"])
+
+    def test_antigravity_keychain_value_is_decoded(self):
+        blob = base64.b64encode(json.dumps({"token": {"access_token": "kc-token",
+                                                      "expiry": "2099-01-01T00:00:00Z"}}).encode()).decode()
+
+        class Out:
+            returncode = 0
+            stdout = "go-keyring-base64:" + blob
+
+        with patch.object(probe.sys, "platform", "darwin"), \
+                patch.object(probe.subprocess, "run", lambda *a, **k: Out()), \
+                patch.object(probe, "HOME", self.tmp.name), patch.object(probe, "ENV", {}), \
+                patch.dict(probe.os.environ, {}, clear=False):
+            probe.os.environ.pop("ANTIGRAVITY_CONFIG_DIR", None)
+            probe.os.environ.pop("HERMES_QUOTA_NO_KEYCHAIN", None)
+            accounts = probe.antigravity_accounts()
+        self.assertEqual([a["token"] for a in accounts], ["kc-token"])
 
 
 if __name__ == "__main__":

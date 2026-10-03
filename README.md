@@ -24,6 +24,7 @@ screenshot.)*
 | **OpenCode Go** | rolling (5h) / weekly / monthly usage % of each window's cap, with reset times |
 | **CommandCode** | plan (GOAT / Pro / Max / Go / Teams), 5h + weekly rate-limit windows ($ used / cap) and the monthly cycle budget (spend / plan total, reset at cycle end), remaining credit balance, cycle end date, and the current billing period's request/token totals |
 | **Claude subscription** | Claude Pro/Max via Claude Code's own login (what `claude-subscription-directsdk-experimental` drives): plan, 5h session + weekly windows (% used, reset time), per-model weekly caps when the plan has them, extra-usage monthly spend when enabled, and the weekly surface mix |
+| **Antigravity subscription** | Google AI Pro/Ultra via agy's own login (what `antigravity-subscription-directsdk` drives): plan, and one bar per model pool (Claude, GPT-OSS, Gemini Pro, Gemini Flash) — % used of the most-used model in the pool, with its reset time |
 | **OmniRoute** | local SQLite metadata and local usage history: configured route aliases (including `coding-safe`), stored model order, local request/token totals, and configured-connection counts |
 | **9router** | local SQLite metadata and local usage history: observed models, local request/token totals, and configured-connection counts; the local database currently has no combo rows |
 
@@ -155,6 +156,7 @@ full router details before rendering.
 | Codex | `chatgpt.com/backend-api/wham/usage` (or `/api/codex/usage`) | ChatGPT OAuth token per pool entry |
 | OpenCode Go | `https://opencode.ai/zen/go/v1/usage` | `OPENCODE_GO_API_KEY` |
 | CommandCode | `https://api.commandcode.ai/alpha/{whoami,billing/credits,billing/subscriptions,usage/summary}` | `COMMANDCODE_API_KEY` |
+| Antigravity subscription | `https://cloudcode-pa.googleapis.com/v1internal:{loadCodeAssist,fetchAvailableModels}` (`quotaInfo.remainingFraction`) | agy's OAuth login: macOS Keychain item `gemini` / `antigravity`, else the token file under `ANTIGRAVITY_CONFIG_DIR` / `~/.gemini/antigravity-cli` |
 | Claude subscription | `https://api.anthropic.com/api/oauth/usage` (`anthropic-beta: oauth-2025-04-20`) | Claude Code's OAuth login: `CLAUDE_CODE_OAUTH_TOKEN`, else the macOS Keychain item `Claude Code-credentials`, else `.credentials.json` under `CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR` / `CLAUDE_CONFIG_DIR` / `~/.claude` |
 
 ## Adding another provider
@@ -232,6 +234,15 @@ re-verify anytime with the standalone probe above.
 - Claude subscription usage comes from `/api/oauth/usage`, the endpoint Claude
   Code's own `/usage` reads — undocumented. The probe never refreshes the OAuth
   token: an expired one is reported, and the next Claude turn refreshes it.
+- That endpoint rate-limits hard (HTTP 429). Claude and Antigravity readings are
+  therefore shared across the pane, the chip, and the TUI line through a
+  numbers-only snapshot in `~/.hermes/cache/quota-dash/` (no tokens): at most
+  one request per account every 180 s (`HERMES_QUOTA_MIN_INTERVAL`). If a
+  request fails, the last good reading is shown with a `last reading HH:MM
+  (HTTP 429)` note instead of an empty card.
+- Antigravity quota uses the Cloud Code `v1internal` endpoints agy itself
+  calls — undocumented. It reports a remaining fraction per model, not a 5h or
+  weekly window, so the pane shows one bar per model pool.
 - CommandCode publishes no monthly *rate-limit* window: `windowLimits` carries
   only the 5h and weekly caps. The monthly figure is a **$ credit budget**
   spread over three endpoints — the plan total from

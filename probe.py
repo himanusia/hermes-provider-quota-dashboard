@@ -1008,6 +1008,62 @@ def probe_commandcode(account: dict) -> dict:
     return row
 
 
+# Usage endpoints that rate-limit hard (Anthropic answers 429 when the desktop
+# pane, chip and TUI all poll): one probe per account per MIN_INTERVAL, shared
+# across every surface through a small on-disk snapshot. The snapshot holds the
+# rendered row only (windows/notes/plan) - never a token.
+SNAPSHOT_DIR = os.path.join(HERMES_HOME, "cache", "quota-dash")
+SNAPSHOT_MIN_INTERVAL = float(os.environ.get("HERMES_QUOTA_MIN_INTERVAL") or 180)
+
+
+def _snapshot_path(provider_id: str, fp: str) -> str:
+    return os.path.join(SNAPSHOT_DIR, f"{provider_id}-{fp[:12]}.json")
+
+
+def read_snapshot(provider_id: str, fp: str):
+    try:
+        with open(_snapshot_path(provider_id, fp), encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) and isinstance(data.get("row"), dict) else None
+    except Exception:
+        return None
+
+
+def write_snapshot(provider_id: str, fp: str, row: dict) -> None:
+    keep = {k: row.get(k) for k in ("plan", "windows", "notes")}
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        tmp = _snapshot_path(provider_id, fp) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"at": time.time(), "row": keep}, handle)
+        os.replace(tmp, _snapshot_path(provider_id, fp))
+    except Exception:
+        pass
+
+
+def with_snapshot(provider_id: str, account: dict, fetch) -> dict:
+    """Serve a fresh-enough snapshot without a request; otherwise fetch, store a
+    good reading, and fall back to the last good reading when the endpoint
+    errors (429, network) - labelled with its age, never passed off as live."""
+    fp = account["fp"]
+    snap = read_snapshot(provider_id, fp)
+    age = time.time() - float(snap["at"]) if snap else None
+    if snap and age is not None and 0 <= age < SNAPSHOT_MIN_INTERVAL:
+        row = fetch(None)
+        row.update({k: v for k, v in snap["row"].items() if v is not None})
+        return row
+    row = fetch(True)
+    if not row.get("error") and row.get("windows"):
+        write_snapshot(provider_id, fp, row)
+    elif row.get("error") and snap and snap["row"].get("windows"):
+        stamp = datetime.fromtimestamp(float(snap["at"])).strftime("%H:%M")
+        reason = row["error"]
+        row.update({k: v for k, v in snap["row"].items() if v is not None})
+        row["error"] = None
+        row["notes"] = [f"last reading {stamp} ({reason.split(' - ')[0]})"] + list(row.get("notes") or [])
+    return row
+
+
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 
@@ -1087,6 +1143,10 @@ CLAUDE_WINDOWS = (
 
 
 def probe_claude(account: dict) -> dict:
+    return with_snapshot("claude-subscription", account, lambda live: _probe_claude(account, live))
+
+
+def _probe_claude(account: dict, live) -> dict:
     token = account["token"]
     base = (account.get("base") or CLAUDE_DEFAULT_BASE).rstrip("/")
     bits = [f"fp {sha(token)[:6]}"]
@@ -1101,6 +1161,8 @@ def probe_claude(account: dict) -> dict:
     if isinstance(expires, (int, float)) and expires and expires / 1000 < time.time():
         # Refreshing would mutate Claude Code's credential store: not ours to do.
         row["error"] = "token expired; run any Claude Code / Hermes Claude turn to refresh it"
+        return row
+    if not live:
         return row
     headers = {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
                "Accept": "application/json", "User-Agent": "claude-code"}
@@ -1151,6 +1213,167 @@ def probe_claude(account: dict) -> dict:
     return row
 
 
+ANTIGRAVITY_DEFAULT_BASE = "https://cloudcode-pa.googleapis.com/v1internal"
+
+
+def antigravity_accounts() -> list:
+    """agy's OAuth login, read-only (never refreshed, never written).
+
+    macOS: login-keychain item service "gemini" / account "antigravity"
+    (go-keyring, value `go-keyring-base64:<json>`). Elsewhere / override: the
+    token file the antigravity-subscription-directsdk provider resolves
+    (ANTIGRAVITY_CONFIG_DIR, else ~/.gemini/antigravity-cli)."""
+    found = []
+
+    def parse(raw: str):
+        raw = (raw or "").strip()
+        if raw.startswith("go-keyring-base64:"):
+            try:
+                raw = base64.b64decode(raw.split(":", 1)[1]).decode("utf-8")
+            except Exception:
+                return None
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None
+        token = data.get("token") if isinstance(data, dict) else None
+        token = token if isinstance(token, dict) else data
+        if isinstance(token, dict) and token.get("access_token"):
+            return token
+        return None
+
+    override = (os.environ.get("ANTIGRAVITY_CONFIG_DIR") or ENV.get("ANTIGRAVITY_CONFIG_DIR") or "").strip()
+    if sys.platform == "darwin" and not override and not os.environ.get("HERMES_QUOTA_NO_KEYCHAIN"):
+        try:
+            out = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", "gemini",
+                                  "-a", "antigravity", "-w"], capture_output=True, text=True, timeout=10)
+            token = parse(out.stdout) if out.returncode == 0 else None
+            if token:
+                found.append(("agy login (keychain)", token))
+        except Exception:
+            pass
+    dirs = [os.path.expanduser(override)] if override else [os.path.join(HOME, ".gemini", "antigravity-cli")]
+    for directory in dirs:
+        for name in ("jetski-standalone-oauth-token", "antigravity-oauth-token"):
+            try:
+                with open(os.path.join(directory, name), encoding="utf-8") as handle:
+                    token = parse(handle.read())
+            except Exception:
+                token = None
+            if token:
+                found.append((f"agy login ({display_path(directory)})", token))
+    seen: set = set()
+    accounts = []
+    for label, token in found:
+        access = str(token["access_token"])
+        fp = sha(access)[:12]
+        if fp in seen:
+            continue
+        seen.add(fp)
+        accounts.append({"label": label, "token": access, "base": ANTIGRAVITY_DEFAULT_BASE, "fp": fp,
+                         "expires": token.get("expiry")})
+    return accounts
+
+
+# fetchAvailableModels lists ~25 model ids that share a few quota pools. Group
+# them by family and meter the most-used model of each pool, so the pane shows
+# a handful of bars instead of every id. Ids without a display name (tab /
+# internal chat models) are not user-selectable and are skipped.
+ANTIGRAVITY_FAMILIES = (
+    ("claude", "Claude models"),
+    ("gpt-oss", "GPT-OSS"),
+    ("gemini-pro", "Gemini Pro"),
+    ("gemini", "Gemini Flash"),
+)
+
+
+def antigravity_family(model_id: str, display: str) -> str | None:
+    text = f"{model_id} {display}".lower()
+    if "claude" in text:
+        return "claude"
+    if "gpt-oss" in text:
+        return "gpt-oss"
+    if "gemini" in text and " pro" in f" {display.lower()}":
+        return "gemini-pro"
+    if "gemini" in text:
+        return "gemini"
+    return None
+
+
+def probe_antigravity(account: dict) -> dict:
+    return with_snapshot("antigravity-subscription", account, lambda live: _probe_antigravity(account, live))
+
+
+def _probe_antigravity(account: dict, live) -> dict:
+    token = account["token"]
+    base = (account.get("base") or ANTIGRAVITY_DEFAULT_BASE).rstrip("/")
+    bits = [f"fp {sha(token)[:6]}"]
+    expiry = account.get("expires")
+    expired = False
+    if expiry:
+        try:
+            at = datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
+            bits.append("token exp " + at.astimezone().strftime("%d %b %H:%M"))
+            expired = at.timestamp() < time.time()
+        except Exception:
+            pass
+    row = {"label": account["label"], "sub": " - ".join(bits), "plan": None,
+           "windows": [], "notes": [], "error": None}
+    if expired:
+        # Refreshing would rewrite agy's keychain item: not ours to do.
+        row["error"] = "token expired; run any agy / Hermes Antigravity turn to refresh it"
+        return row
+    if not live:
+        return row
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+               "Accept": "application/json", "User-Agent": "antigravity"}
+    try:
+        load = httpx.post(base + ":loadCodeAssist", headers=headers,
+                          json={"metadata": {"ideType": "ANTIGRAVITY"}}, timeout=TIMEOUT)
+        if load.status_code in (401, 403):
+            row["error"] = f"HTTP {load.status_code} - login rejected; sign in again with agy"
+            return row
+        if load.status_code != 200:
+            row["error"] = f"loadCodeAssist HTTP {load.status_code}"
+            return row
+        info = load.json() or {}
+        tier = info.get("paidTier") or info.get("currentTier") or {}
+        row["plan"] = safe_text(tier.get("name"), 40) or None
+        project = info.get("cloudaicompanionProject")
+        models = httpx.post(base + ":fetchAvailableModels", headers=headers,
+                            json={"project": project} if project else {}, timeout=TIMEOUT)
+        if models.status_code == 429:
+            row["error"] = "HTTP 429 - quota endpoint rate-limited; retry in a minute"
+            return row
+        if models.status_code != 200:
+            row["error"] = f"fetchAvailableModels HTTP {models.status_code}"
+            return row
+        pools: dict = {}
+        for model_id, model in ((models.json() or {}).get("models") or {}).items():
+            if not isinstance(model, dict) or not model.get("displayName"):
+                continue
+            quota = model.get("quotaInfo") or {}
+            remaining = quota.get("remainingFraction")
+            family = antigravity_family(str(model_id), str(model["displayName"]))
+            if family is None or not isinstance(remaining, (int, float)):
+                continue
+            used = round((1 - float(remaining)) * 100, 1)
+            pool = pools.setdefault(family, {"pct": used, "reset": quota.get("resetTime"), "names": set()})
+            pool["names"].add(str(model["displayName"]).split(" (")[0])
+            if used > pool["pct"]:
+                pool["pct"], pool["reset"] = used, quota.get("resetTime")
+        for family, label in ANTIGRAVITY_FAMILIES:
+            pool = pools.get(family)
+            if pool:
+                row["windows"].append({"k": label, "pct": pool["pct"], "reset": local_iso(pool["reset"]),
+                                       "note": ", ".join(sorted(pool["names"]))[:60]})
+        if not row["windows"]:
+            row["notes"].append("no metered models reported")
+    except Exception as exc:
+        row["error"] = f"{type(exc).__name__}: {str(exc)[:80]}"
+    return row
+
+
 ROW_CONTRACT = {"label": "?", "sub": "", "plan": None, "acct": None,
                 "windows": [], "notes": [], "error": None}
 
@@ -1185,6 +1408,10 @@ PROVIDERS = (
     # provider: "accounts" overrides the pool/env lookup.
     {"id": "claude-subscription", "name": "Claude (subscription)", "env_var": "",
      "base": CLAUDE_DEFAULT_BASE, "probe": probe_claude, "accounts": claude_accounts},
+    # Antigravity / Google AI subscription via agy's own OAuth login (the
+    # account antigravity-subscription-directsdk drives).
+    {"id": "antigravity-subscription", "name": "Antigravity (subscription)", "env_var": "",
+     "base": ANTIGRAVITY_DEFAULT_BASE, "probe": probe_antigravity, "accounts": antigravity_accounts},
 )
 
 

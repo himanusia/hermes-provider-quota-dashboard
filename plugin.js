@@ -4,7 +4,8 @@
  *
  * A desktop pane with live quota readouts for EVERY account of OpenAI Codex
  * (credential pool), OpenCode Go, CommandCode, and the Claude Pro/Max
- * subscription (Claude Code's OAuth login) — plus read-only local
+ * subscription (Claude Code's OAuth login), and the Antigravity / Google AI
+ * subscription (agy's OAuth login) — plus read-only local
  * OmniRoute and 9router history/configuration with route explanations hidden
  * behind collapsed details.
  *
@@ -45,7 +46,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const ID = 'quota-dash'
 const QUERY_KEY = ['quota-dash', 'quotas']
 const SENTINEL = '@@QUOTA@@'
-const PROVIDER_IDS = ['openai-codex', 'opencode-go', 'commandcode', 'claude-subscription']
+const PROVIDER_IDS = ['openai-codex', 'opencode-go', 'commandcode', 'claude-subscription', 'antigravity-subscription']
 const ROUTER_IDS = ['omniroute', '9router']
 
 // --- display settings -------------------------------------------------------
@@ -57,6 +58,7 @@ const SECTION_LABELS = {
   'opencode-go': 'OpenCode Go',
   commandcode: 'CommandCode',
   'claude-subscription': 'Claude subscription',
+  'antigravity-subscription': 'Antigravity subscription',
   omniroute: 'OmniRoute (local)',
   '9router': '9router (local)'
 }
@@ -1268,7 +1270,8 @@ const PROVIDER_LABELS = {
   'openai-codex': 'Codex',
   'opencode-go': 'OpenCode Go',
   commandcode: 'CommandCode',
-  'claude-subscription': 'Claude'
+  'claude-subscription': 'Claude',
+  'antigravity-subscription': 'Antigravity'
 }
 // One plugin icon, not per-provider glyphs: the chip is the dashboard's
 // toggle, so it wears the same codicon as the sidebar row and the page.
@@ -1287,7 +1290,10 @@ const PROVIDER_ALIASES = {
   'claude-subscription': 'claude-subscription',
   'claude-subscription-directsdk-experimental': 'claude-subscription',
   'claude-subscription-directsdk': 'claude-subscription',
-  'claude-code': 'claude-subscription'
+  'claude-code': 'claude-subscription',
+  'antigravity-subscription': 'antigravity-subscription',
+  'antigravity-subscription-directsdk': 'antigravity-subscription',
+  antigravity: 'antigravity-subscription'
 }
 
 /** Best-effort map from a model slug (`host.model`) to one of the quota
@@ -1484,7 +1490,7 @@ export default {
       data: {
         id: 'quota-dash.refresh',
         label: 'Quota: refresh dashboard',
-        keywords: ['quota', 'usage', 'limits', 'codex', 'opencode', 'commandcode', 'claude'],
+        keywords: ['quota', 'usage', 'limits', 'codex', 'opencode', 'commandcode', 'claude', 'antigravity'],
         run: () => {
           haptic('tap')
           void queryClient.invalidateQueries({ queryKey: QUERY_KEY })

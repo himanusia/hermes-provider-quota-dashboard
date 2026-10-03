@@ -3,7 +3,8 @@
  * https://github.com/himanusia/hermes-provider-quota-dashboard
  *
  * A desktop pane with live quota readouts for EVERY account of OpenAI Codex
- * (credential pool), OpenCode Go, and CommandCode — plus read-only local
+ * (credential pool), OpenCode Go, CommandCode, and the Claude Pro/Max
+ * subscription (Claude Code's OAuth login) — plus read-only local
  * OmniRoute and 9router history/configuration with route explanations hidden
  * behind collapsed details.
  *
@@ -28,6 +29,7 @@ import {
   SIDEBAR_NAV_AREA,
   Skeleton,
   STATUSBAR_AREAS,
+  Switch,
   Tip,
   atom,
   cn,
@@ -43,8 +45,57 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const ID = 'quota-dash'
 const QUERY_KEY = ['quota-dash', 'quotas']
 const SENTINEL = '@@QUOTA@@'
-const PROVIDER_IDS = ['openai-codex', 'opencode-go', 'commandcode']
+const PROVIDER_IDS = ['openai-codex', 'opencode-go', 'commandcode', 'claude-subscription']
 const ROUTER_IDS = ['omniroute', '9router']
+
+// --- display settings -------------------------------------------------------
+// What the dashboard shows is user-configurable (⚙ in the pane header, or ⌘K
+// "Quota: settings"). A hidden provider/router is not probed at all, so a
+// subscription you do not have costs no request. Persisted via ctx.storage.
+const SECTION_LABELS = {
+  'openai-codex': 'Codex',
+  'opencode-go': 'OpenCode Go',
+  commandcode: 'CommandCode',
+  'claude-subscription': 'Claude subscription',
+  omniroute: 'OmniRoute (local)',
+  '9router': '9router (local)'
+}
+const DEFAULT_PREFS = {
+  sections: Object.fromEntries([...PROVIDER_IDS, ...ROUTER_IDS].map(id => [id, true])),
+  chip: true,
+  notes: true,
+  plan: true
+}
+const PREFS_KEY = 'displayPrefs'
+let prefsStorage = null
+const $prefs = atom(DEFAULT_PREFS)
+
+function normalizePrefs(raw) {
+  const value = raw && typeof raw === 'object' ? raw : {}
+  const sections = { ...DEFAULT_PREFS.sections }
+
+  for (const id of Object.keys(sections)) {
+    if (value.sections && typeof value.sections[id] === 'boolean') {
+      sections[id] = value.sections[id]
+    }
+  }
+
+  const flag = key => (typeof value[key] === 'boolean' ? value[key] : DEFAULT_PREFS[key])
+
+  return { sections, chip: flag('chip'), notes: flag('notes'), plan: flag('plan') }
+}
+
+function setPrefs(update) {
+  const next = normalizePrefs(typeof update === 'function' ? update($prefs.get()) : update)
+  $prefs.set(next)
+  if (prefsStorage) {
+    prefsStorage.set(PREFS_KEY, next)
+  }
+  // Newly enabled sections must load; disabled ones drop out of the poll.
+  void queryClient.invalidateQueries({ queryKey: QUERY_KEY })
+}
+
+const enabledIds = (ids, prefs = $prefs.get()) => ids.filter(id => prefs.sections[id] !== false)
 const ROUTE_PAGE_SIZE = 8
 
 // Runs on the backend host. Backend env can override every path:
@@ -69,7 +120,7 @@ function buildProbeCommand({ provider, account, router, routerPart, routeOffset,
     }
   } else if (account && /^[a-z0-9-]+:[0-9a-f]{6,12}$/.test(account)) {
     cmd += ` --account ${account}`
-  } else if (provider && /^[a-z0-9-]+$/.test(provider)) {
+  } else if (provider && PROVIDER_IDS.includes(provider)) {
     cmd += ` --provider ${provider}`
   }
 
@@ -179,8 +230,8 @@ async function fetchQuotas(filters) {
 
   const started = Date.now()
   const [providerPayloads, routerPayloads] = await Promise.all([
-    Promise.all(PROVIDER_IDS.map(provider => runProbe({ provider }))),
-    Promise.all(ROUTER_IDS.map(router => fetchRouter(router)))
+    Promise.all(enabledIds(PROVIDER_IDS).map(provider => runProbe({ provider }))),
+    Promise.all(enabledIds(ROUTER_IDS).map(router => fetchRouter(router)))
   ])
 
   return {
@@ -283,7 +334,8 @@ function WindowRow({ window: w }) {
 }
 
 function AccountCard({ account, sharedCreds, busy, onRefresh }) {
-  const notes = account.notes || []
+  const prefs = useValue($prefs)
+  const notes = prefs.notes ? account.notes || [] : []
   const windows = account.windows || []
   const creds = sharedCreds || []
   const merged = creds.length > 1
@@ -299,7 +351,7 @@ function AccountCard({ account, sharedCreds, busy, onRefresh }) {
             className: cn('min-w-0 flex-1 text-xs font-medium', merged ? 'break-words leading-snug' : 'truncate'),
             children: title
           }),
-          account.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: account.plan }) : null,
+          account.plan && prefs.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: account.plan }) : null,
           jsx(RefreshButton, { busy, onRefresh, label: merged ? 'Refresh all credentials' : `Refresh ${account.label}` })
         ]
       }),
@@ -863,7 +915,46 @@ function LocalRouterSection({ router, busy, onRefresh }) {
   })
 }
 
+function SettingRow({ label, checked, onChange }) {
+  return jsxs('label', {
+    className: 'flex cursor-pointer items-center justify-between gap-2 text-[0.6875rem] text-(--ui-text-secondary)',
+    children: [
+      jsx('span', { className: 'truncate', children: label }),
+      jsx(Switch, { size: 'xs', checked, onCheckedChange: value => onChange(Boolean(value)) })
+    ]
+  })
+}
+
+function QuotaSettings() {
+  const prefs = useValue($prefs)
+  const section = id =>
+    jsx(SettingRow, {
+      label: SECTION_LABELS[id] || id,
+      checked: prefs.sections[id] !== false,
+      onChange: value => setPrefs(current => ({ ...current, sections: { ...current.sections, [id]: value } }))
+    }, id)
+  const flag = (key, label) =>
+    jsx(SettingRow, { label, checked: prefs[key], onChange: value => setPrefs(current => ({ ...current, [key]: value })) }, key)
+  const heading = text => jsx('div', { className: 'pt-1 text-[0.65rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: text })
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-1.5 rounded-md border border-(--ui-stroke-secondary) p-2',
+    children: [
+      heading('Providers'),
+      ...PROVIDER_IDS.map(section),
+      heading('Local routers'),
+      ...ROUTER_IDS.map(section),
+      heading('Display'),
+      flag('chip', 'Statusbar chip'),
+      flag('plan', 'Plan badge'),
+      flag('notes', 'Account notes')
+    ]
+  })
+}
+
 function QuotaPane() {
+  const prefs = useValue($prefs)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [busyProviders, setBusyProviders] = useState({})
   const [busyAccounts, setBusyAccounts] = useState({})
   const [busyRouters, setBusyRouters] = useState({})
@@ -1015,7 +1106,10 @@ function QuotaPane() {
   }
 
   const fetchedAt = query.data && query.data.fetchedAt ? new Date(query.data.fetchedAt) : null
-  const routers = (query.data && query.data.routers) || []
+  // Filter at render too: a cached payload from before a toggle must not
+  // keep showing a section the user just hid.
+  const routers = ((query.data && query.data.routers) || []).filter(router => prefs.sections[router.id] !== false)
+  const shownProviders = ((query.data && query.data.providers) || []).filter(provider => prefs.sections[provider.id] !== false)
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-3 overflow-y-auto p-3 text-sm',
@@ -1035,6 +1129,13 @@ function QuotaPane() {
                 : null,
               jsx(Button, {
                 variant: 'ghost',
+                className: cn('h-5 w-5 p-0', settingsOpen && 'text-foreground'),
+                title: settingsOpen ? 'Close settings' : 'Choose what the dashboard shows',
+                onClick: () => setSettingsOpen(open => !open),
+                children: jsx(Codicon, { name: 'settings-gear', size: '0.75rem' })
+              }),
+              jsx(Button, {
+                variant: 'ghost',
                 className: 'h-5 px-1 text-[0.7rem]',
                 onClick: refreshAll,
                 disabled: query.isFetching,
@@ -1044,6 +1145,7 @@ function QuotaPane() {
           })
         ]
       }),
+      settingsOpen ? jsx(QuotaSettings, {}) : null,
       query.isLoading
         ? jsxs('div', {
             className: 'flex flex-col gap-2',
@@ -1075,7 +1177,7 @@ function QuotaPane() {
           : jsxs('div', {
               className: 'flex flex-col gap-3',
               children: [
-                ...((query.data && query.data.providers) || []).map(provider =>
+                ...shownProviders.map(provider =>
                   jsx(
                     ProviderSection,
                     {
@@ -1088,6 +1190,9 @@ function QuotaPane() {
                     provider.id
                   )
                 ),
+                ...(!shownProviders.length && !routers.length && !query.isFetching
+                  ? [jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: 'Nothing selected — open ⚙ to choose providers.' }, 'empty')]
+                  : []),
                 ...(routers.length
                   ? [
                       jsx('div', { className: 'pt-1 text-xs font-medium text-(--ui-text-secondary)', children: 'Local routers' }),
@@ -1159,7 +1264,12 @@ function togglePane() {
 
 // --- statusbar chip: the live session's provider + its 5h limit ---------------
 
-const PROVIDER_LABELS = { 'openai-codex': 'Codex', 'opencode-go': 'OpenCode Go', commandcode: 'CommandCode' }
+const PROVIDER_LABELS = {
+  'openai-codex': 'Codex',
+  'opencode-go': 'OpenCode Go',
+  commandcode: 'CommandCode',
+  'claude-subscription': 'Claude'
+}
 // One plugin icon, not per-provider glyphs: the chip is the dashboard's
 // toggle, so it wears the same codicon as the sidebar row and the page.
 const CHIP_ICON = 'dashboard'
@@ -1173,7 +1283,11 @@ const PROVIDER_ALIASES = {
   commandcode: 'commandcode',
   'commandcode-chat': 'commandcode',
   'commandcode-claude': 'commandcode',
-  'commandcode-anthropic': 'commandcode'
+  'commandcode-anthropic': 'commandcode',
+  'claude-subscription': 'claude-subscription',
+  'claude-subscription-directsdk-experimental': 'claude-subscription',
+  'claude-subscription-directsdk': 'claude-subscription',
+  'claude-code': 'claude-subscription'
 }
 
 /** Best-effort map from a model slug (`host.model`) to one of the quota
@@ -1204,6 +1318,11 @@ function providerForModel(slug) {
   if (/luna|sol|terra|codex|gpt-5|(^|\/)o[34]/.test(text)) {
     return 'openai-codex'
   }
+
+  if (/^claude-(opus|sonnet|haiku|fable)/.test(text)) {
+    return 'claude-subscription'
+  }
+
   return null
 }
 
@@ -1215,7 +1334,7 @@ function fiveHourWindow(provider) {
   }
 
   const windows = (provider.accounts || []).flatMap(account => account.windows || [])
-  const fives = windows.filter(w => String(w.k || '').toLowerCase().includes('5h'))
+  const fives = windows.filter(w => /5h|session/i.test(String(w.k || '')))
   const pool = fives.length ? fives : windows
 
   return pool.length ? pool.reduce((worst, w) => (w.pct > worst.pct ? w : worst)) : null
@@ -1265,7 +1384,8 @@ function QuotaChip() {
     retryDelay: attempt => Math.min(1_000 * 2 ** attempt, 10_000)
   })
 
-  const providers = (query.data && query.data.providers) || []
+  const prefs = useValue($prefs)
+  const providers = ((query.data && query.data.providers) || []).filter(provider => prefs.sections[provider.id] !== false)
   const providerId =
     PROVIDER_ALIASES[String((focused && focused.provider) || '').toLowerCase()] || providerForModel(model)
   let active = providers.find(provider => provider.id === providerId) || null
@@ -1294,6 +1414,10 @@ function QuotaChip() {
   ]
     .filter(Boolean)
     .join(' · ')
+
+  if (!prefs.chip) {
+    return null
+  }
 
   return jsx(Tip, {
     label: tooltip,
@@ -1329,6 +1453,8 @@ export default {
   name: 'Provider Quota Dashboard',
   register(ctx) {
     paneCtx = ctx
+    prefsStorage = ctx.storage
+    $prefs.set(normalizePrefs(ctx.storage.get(PREFS_KEY, DEFAULT_PREFS)))
     paneDisposer = ctx.register(paneContribution())
     $paneOpen.set(true)
 
@@ -1358,7 +1484,7 @@ export default {
       data: {
         id: 'quota-dash.refresh',
         label: 'Quota: refresh dashboard',
-        keywords: ['quota', 'usage', 'limits', 'codex', 'opencode', 'commandcode'],
+        keywords: ['quota', 'usage', 'limits', 'codex', 'opencode', 'commandcode', 'claude'],
         run: () => {
           haptic('tap')
           void queryClient.invalidateQueries({ queryKey: QUERY_KEY })
@@ -1416,6 +1542,34 @@ export default {
         }
       }
     })
+
+    ctx.register({
+      id: 'toggle-chip',
+      area: PALETTE_AREA,
+      data: {
+        id: 'quota-dash.toggle-chip',
+        label: 'Quota: toggle statusbar chip',
+        keywords: ['quota', 'chip', 'statusbar', 'settings'],
+        run: () => setPrefs(current => ({ ...current, chip: !current.chip }))
+      }
+    })
+
+    for (const sectionId of [...PROVIDER_IDS, ...ROUTER_IDS]) {
+      ctx.register({
+        id: `toggle-${sectionId}`,
+        area: PALETTE_AREA,
+        data: {
+          id: `quota-dash.toggle.${sectionId}`,
+          label: `Quota: show/hide ${SECTION_LABELS[sectionId]}`,
+          keywords: ['quota', 'settings', 'show', 'hide', sectionId],
+          run: () => {
+            const next = !($prefs.get().sections[sectionId] !== false)
+            setPrefs(current => ({ ...current, sections: { ...current.sections, [sectionId]: next } }))
+            host.notify({ kind: 'info', message: `${SECTION_LABELS[sectionId]} ${next ? 'shown' : 'hidden'} in Quota Dashboard.` })
+          }
+        }
+      })
+    }
 
     ctx.register({
       id: 'page-open',

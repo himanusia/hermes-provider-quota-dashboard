@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -233,7 +234,7 @@ class LocalRouterProbeTests(unittest.TestCase):
         self.assertIn("quota-meter-fill", plugin_source)
         self.assertIn("function quotaPctOrNull(value)", plugin_source)
         self.assertIn("const usedHigh = usedPctFromRemaining(snapshot.lowestRemainingPct)", plugin_source)
-        self.assertIn("PROVIDER_IDS.map(provider => runProbe({ provider }))", plugin_source)
+        self.assertIn("enabledIds(PROVIDER_IDS).map(provider => runProbe({ provider }))", plugin_source)
         self.assertIn("routerPart: 'summary'", plugin_source)
         self.assertIn("routerPart: 'routes'", plugin_source)
         self.assertNotIn("open: true", plugin_source)
@@ -390,6 +391,103 @@ class CommandCodeProbeTests(unittest.TestCase):
         row = self.row(self.payloads(), status_code=500)
         self.assertIn("HTTP 500", row["error"] or "")
         self.assertEqual(row["windows"], [])
+
+
+class ClaudeSubscriptionProbeTests(unittest.TestCase):
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    USAGE = {
+        "five_hour": {"utilization": 13.0, "resets_at": "2026-10-03T13:49:59+00:00", "locked_reason": None},
+        "seven_day": {"utilization": 2.0, "resets_at": "2026-10-03T13:59:59+00:00"},
+        "seven_day_opus": None,
+        "seven_day_sonnet": {"utilization": 40.0, "resets_at": "2026-10-05T00:00:00+00:00"},
+        "iguana_necktie": {"utilization": 99.0},
+        "extra_usage": {"is_enabled": True, "monthly_limit": 5000, "used_credits": 1250,
+                        "currency": "usd", "decimal_places": 2, "spend_limit_reached": False},
+        "seven_day_breakdown": {"rows": [{"display_name": "Claude Code", "percent": 100},
+                                         {"display_name": "Chats", "percent": 0}]},
+    }
+
+    def account(self, **extra):
+        return {"label": "Claude Code login (keychain)", "token": "sample-oauth-token", "base": "",
+                "fp": "deadbeef", "plan": "pro", "tier": "default_claude_ai",
+                "expires": (time.time() + 3600) * 1000, **extra}
+
+    def run_probe(self, payload, status_code=200, **extra):
+        seen = {}
+
+        def get(url, headers=None, timeout=None):
+            seen["url"], seen["headers"] = url, headers
+            return self.Response(status_code, payload)
+
+        with patch.object(probe.httpx, "get", get):
+            return probe.probe_claude(self.account(**extra)), seen
+
+    def test_windows_map_to_the_shared_row_contract(self):
+        row, seen = self.run_probe(self.USAGE)
+        self.assertTrue(seen["url"].endswith("/api/oauth/usage"))
+        self.assertEqual(seen["headers"]["anthropic-beta"], "oauth-2025-04-20")
+        self.assertIsNone(row["error"])
+        self.assertEqual(row["plan"], "Pro")
+        self.assertEqual([w["k"] for w in row["windows"]],
+                         ["session (5h)", "weekly", "weekly sonnet", "extra usage (monthly)"])
+        self.assertEqual(row["windows"][0]["pct"], 13.0)
+        self.assertEqual(row["windows"][3]["pct"], 25.0)
+        self.assertEqual(row["windows"][3]["note"], "12.50 / 50 USD")
+        self.assertIn("weekly mix: Claude Code 100%", row["notes"])
+
+    def test_codenamed_and_null_windows_are_never_guessed(self):
+        row, _ = self.run_probe(self.USAGE)
+        self.assertFalse(any("iguana" in w["k"] or "opus" in w["k"] for w in row["windows"]))
+
+    def test_the_token_never_reaches_the_payload(self):
+        row, _ = self.run_probe(self.USAGE)
+        self.assertNotIn("sample-oauth-token", json.dumps(row))
+
+    def test_an_expired_token_is_reported_without_a_request_or_refresh(self):
+        calls = []
+        with patch.object(probe.httpx, "get", lambda *a, **k: calls.append(a)):
+            row = probe.probe_claude(self.account(expires=(time.time() - 60) * 1000))
+        self.assertEqual(calls, [])
+        self.assertIn("expired", row["error"])
+
+    def test_a_rejected_login_is_reported(self):
+        row, _ = self.run_probe({}, status_code=401)
+        self.assertIn("HTTP 401", row["error"])
+        self.assertEqual(row["windows"], [])
+
+    def test_credentials_file_is_read_and_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            creds = {"claudeAiOauth": {"accessToken": "file-token", "subscriptionType": "max",
+                                       "expiresAt": 1}}
+            Path(tmp, ".credentials.json").write_text(json.dumps(creds))
+            env = {"CLAUDE_CONFIG_DIR": tmp, "HERMES_QUOTA_NO_KEYCHAIN": "1"}
+            with patch.dict(probe.os.environ, env, clear=False), \
+                    patch.object(probe, "ENV", {}), patch.object(probe, "HOME", tmp):
+                probe.os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+                probe.os.environ.pop("CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR", None)
+                accounts = probe.claude_accounts()
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["plan"], "max")
+        self.assertEqual(accounts[0]["fp"], probe.sha("file-token")[:12])
+
+    def test_provider_is_registered_with_its_own_account_resolver(self):
+        entry = next(p for p in probe.PROVIDERS if p["id"] == "claude-subscription")
+        self.assertIs(entry["accounts"], probe.claude_accounts)
+        self.assertIs(entry["probe"], probe.probe_claude)
+
+    def test_plugin_exposes_display_settings(self):
+        source = (Path(__file__).parent / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("'claude-subscription'", source)
+        self.assertIn("'claude-subscription-directsdk-experimental': 'claude-subscription'", source)
+        self.assertIn("ctx.storage.get(PREFS_KEY", source)
+        self.assertIn("enabledIds(PROVIDER_IDS)", source)
 
 
 if __name__ == "__main__":

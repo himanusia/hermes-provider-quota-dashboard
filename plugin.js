@@ -335,7 +335,7 @@ function WindowRow({ window: w }) {
   })
 }
 
-function AccountCard({ account, sharedCreds, busy, onRefresh }) {
+function AccountCard({ account, sharedCreds, busy, onRefresh, active }) {
   const prefs = useValue($prefs)
   const notes = prefs.notes ? account.notes || [] : []
   const windows = account.windows || []
@@ -344,7 +344,8 @@ function AccountCard({ account, sharedCreds, busy, onRefresh }) {
   const title = merged ? creds.map(cred => cred.label).join(' · ') : account.label
 
   return jsxs('div', {
-    className: 'flex flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-2',
+    className: cn('flex flex-col gap-2 rounded-md border p-2',
+      active ? 'border-(--ui-accent)' : 'border-(--ui-stroke-secondary)'),
     children: [
       jsxs('div', {
         className: 'flex items-start gap-1.5',
@@ -353,6 +354,7 @@ function AccountCard({ account, sharedCreds, busy, onRefresh }) {
             className: cn('min-w-0 flex-1 text-xs font-medium', merged ? 'break-words leading-snug' : 'truncate'),
             children: title
           }),
+          active ? jsx(Badge, { variant: 'muted', size: 'xs', children: 'active' }) : null,
           account.plan && prefs.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: account.plan }) : null,
           jsx(RefreshButton, { busy, onRefresh, label: merged ? 'Refresh all credentials' : `Refresh ${account.label}` })
         ]
@@ -384,6 +386,78 @@ function AccountCard({ account, sharedCreds, busy, onRefresh }) {
   })
 }
 
+// The list above shows every credential; the bottom panel answers the other
+// question — "which account is Hermes using right now?" — one row per provider,
+// so a rotating pool never buries the live credential among its backups.
+function ActiveAccountPanel({ providers }) {
+  const prefs = useValue($prefs)
+  const rows = []
+
+  for (const provider of providers || []) {
+    const accounts = provider.accounts || []
+    const hint = provider.active_account || {}
+    const active = accounts.find(account => account.is_active)
+      || accounts.find(account => account.fp && account.fp === hint.fp)
+      || (accounts.length === 1 ? accounts[0] : null)
+
+    if (active) {
+      rows.push({ provider, account: active })
+    }
+  }
+
+  if (!rows.length) {
+    return null
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md border border-(--ui-accent) p-2',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-1.5',
+        children: [
+          jsx('div', { className: 'min-w-0 flex-1 truncate text-xs font-medium', children: 'Active accounts' }),
+          jsx(Badge, { variant: 'outline', size: 'xs', children: String(rows.length) })
+        ]
+      }),
+      jsx('div', {
+        className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+        children: 'The credential each provider is serving right now'
+      }),
+      ...rows.map(({ provider, account }) =>
+        jsxs(
+          'div',
+          {
+            className: 'flex flex-col gap-1.5 rounded border border-(--ui-stroke-secondary) p-1.5',
+            children: [
+              jsxs('div', {
+                className: 'flex items-center gap-1.5',
+                children: [
+                  jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.7rem] font-medium', children: provider.name }),
+                  jsx('span', {
+                    className: 'min-w-0 truncate text-[0.7rem] text-(--ui-text-secondary)',
+                    children: account.label || account.fp || 'default'
+                  }),
+                  account.plan && prefs.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: account.plan }) : null
+                ]
+              }),
+              (account.windows || []).length
+                ? jsxs('div', {
+                    className: 'flex flex-col gap-1.5',
+                    children: (account.windows || []).map(w => jsx(WindowRow, { window: w, key: w.k }))
+                  })
+                : jsx('div', {
+                    className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+                    children: account.error ? `⚠ ${account.error}` : 'no quota window'
+                  })
+            ]
+          },
+          `${provider.id}|active|${account.fp || account.label}`
+        )
+      )
+    ]
+  })
+}
+
 function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRefreshAccount }) {
   // Credentials that resolve to the same account share one quota — collapse
   // them into a single card; the card lists the credentials that share it.
@@ -394,12 +468,15 @@ function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRe
     let group = groups.find(candidate => candidate.key === key)
 
     if (!group) {
-      group = { key, account, creds: [] }
+      group = { key, account, creds: [], active: false }
       groups.push(group)
     } else if (group.account.error && !account.error) {
       group.account = account
     }
 
+    // A group is live when any credential resolving to it is the active one
+    // (the probe flags is_active on the row the pool would serve next).
+    group.active = group.active || Boolean(account.is_active)
     group.creds.push({ label: account.label, fp: account.fp, error: account.error })
   }
 
@@ -422,6 +499,7 @@ function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRe
               {
                 account: group.account,
                 sharedCreds: group.creds,
+                active: group.active,
                 busy: group.creds.some(cred => Boolean(busyAccounts[`${provider.id}:${cred.fp}`])),
                 onRefresh: () => group.creds.filter(cred => cred.fp).forEach(cred => onRefreshAccount(provider.id, cred.fp, cred.label))
               },
@@ -1212,7 +1290,9 @@ function QuotaPane() {
                     ]
                   : [])
               ]
-            })
+            }),
+      // Bottom summary: the live credential per provider (the list keeps all).
+      jsx(ActiveAccountPanel, { providers: shownProviders })
     ]
   })
 }

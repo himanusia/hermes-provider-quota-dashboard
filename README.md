@@ -22,7 +22,9 @@ screenshot.)*
 |---|---|
 | **OpenAI Codex** | every pool credential: plan, 5h session + weekly windows (% used, reset time), banked resets, credit balance, token expiry, and short credential/account fingerprints. Credentials that resolve to the same account share one quota, so they collapse into a single card listing the credentials behind it |
 | **OpenCode Go** | rolling (5h) / weekly / monthly usage % of each window's cap, with reset times |
-| **CommandCode** | plan (GOAT / Pro / Max / Go / Teams), 5h and weekly windows ($ used / cap), monthly credit balance, renewal date, and the current billing period's request/token totals |
+| **CommandCode** | plan (GOAT / Pro / Max / Go / Teams), 5h + weekly rate-limit windows ($ used / cap) and the monthly cycle budget (spend / plan total, reset at cycle end), remaining credit balance, cycle end date, and the current billing period's request/token totals |
+| **OmniRoute** | local SQLite metadata and local usage history: configured route aliases (including `coding-safe`), stored model order, local request/token totals, and configured-connection counts |
+| **9router** | local SQLite metadata and local usage history: observed models, local request/token totals, and configured-connection counts; the local database currently has no combo rows |
 
 Ways to open it: a **status-bar chip** that follows the FOCUSED chat — it reads
 the focused session's live provider/model (the same `model.options` read the
@@ -90,6 +92,56 @@ single `@@QUOTA@@ {json}` line. `plugin.js` fetches that line through the
 gateway's `shell.exec` RPC, parses it, and renders the bars — refreshed every
 60 s and on demand.
 
+### Local router sections
+
+The OmniRoute and 9router sections use **only read-only local SQLite files**:
+
+| Router | Local source | Read-only tables |
+|---|---|---|
+| **OmniRoute** | `~/.omniroute/storage.sqlite` | `usage_history`, `call_logs`, `combos`, `model_combo_mappings`, `provider_connections`, and cached `quota_snapshots` |
+| **9router** | `~/.9router/db/data.sqlite` | `usageHistory`, `usageDaily`, `combos`, `providerConnections`, and `settings` |
+
+The probe opens these databases with SQLite `mode=ro` plus a connection-local
+`query_only` guard. It never invokes `omniroute`/`9router`, sends an HTTP request
+to either router, tests a configured provider, refreshes a credential, or
+changes router state. Missing or incompatible databases render as
+**unavailable/configured** with no invented metrics.
+
+Local request/token totals and the optional local cost ledger are router
+history, not upstream subscription quota. The main cards visualize that history
+as compact request/token tiles and route-mix bars; cached OmniRoute snapshots
+are shown as used-quota meters (converted from the stored remaining%).
+Last local activity and database-check time are
+shown separately. Route explanations and source metadata stay collapsed by
+default. Expanded details include exact snapshot/reset metadata. Those values are
+read from local storage, not refreshed by the dashboard. The current 9router
+schema has no cached upstream quota snapshot table, so it shows local request
+history only and a no-cache state rather than invented quota.
+
+For the installed local state, OmniRoute's `coding-safe` alias is intended for
+coding requests (the name is not a sandbox or safety guarantee) and uses a
+priority route with this model order: `command-code/deepseek/deepseek-v4.1-flash`
+→ `opencode-go/deepseek-v4.1-flash` → `codex/gpt-5.6-luna`. Later entries are
+fallback candidates in the stored order; this is a local routing preference,
+not proof of provider availability or quota. Other aliases are explained from
+stored metadata when present; an alias observed only in local logs (for example
+`auto/fast`) is explicitly marked as observed rather than assigned an inferred
+candidate list. The current 9router database has no configured combo rows, so
+its section shows observed models only.
+
+To verify the router path without querying any external provider usage API:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python probe.py \
+  --router omniroute --router 9router
+```
+
+The `--router` mode intentionally emits no provider rows and is used by the
+hermetic tests. The desktop transport fetches providers and routers separately;
+OmniRoute model history is paged in 8-row chunks. This keeps each sentinel
+response under the gateway `shell.exec` 4 KB output cap, then reassembles the
+full router details before rendering.
+
 ### Data endpoints
 
 | Provider | Endpoint | Credential |
@@ -144,6 +196,19 @@ one row per credential — the UI collapses rows that share an `acct`.
 - **No credentials in this repo.** Keys are read at runtime from the Hermes
   credential pool / `~/.hermes/.env` on your machine.
 
+## Verification
+
+The repository includes a hermetic local-router harness. It creates temporary
+SQLite fixtures, asserts the `mode=ro` probe leaves them unchanged, checks
+missing-database behavior, and proves `--router` mode does not invoke provider
+probes:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python -m unittest -v test_probe.py
+node --check plugin.js
+~/.hermes/hermes-agent/venv/bin/python -m py_compile probe.py
+```
+
 ## Status
 
 End-to-end verified **2026-09-12** on macOS (Hermes Desktop, local backend):
@@ -157,6 +222,14 @@ re-verify anytime with the standalone probe above.
   (use the account, or re-auth, then refresh the pane).
 - CommandCode support uses the same `/alpha/…` endpoints its own CLI uses for
   `/usage` — undocumented, and may change without notice.
+- CommandCode publishes no monthly *rate-limit* window: `windowLimits` carries
+  only the 5h and weekly caps. The monthly figure is a **$ credit budget**
+  spread over three endpoints — the plan total from
+  `billing/subscriptions`, spend from `usage/summary` (`periodBasis:
+  "billing-period"`), and the remaining balance from `billing/credits` — so the
+  probe synthesizes one `monthly` window (`spend / plan total`, reset = cycle
+  end). An unrecognized `planId` has no cap, so that account keeps its balance
+  note and no monthly bar rather than a made-up percentage.
 - OpenCode Go percentages are the provider's own usage % of each window cap
   (5-hour = 20% of the monthly limit, weekly = 50%; see opencode.ai/docs/go).
   Numbers are shown exactly as returned; nothing is recomputed locally.

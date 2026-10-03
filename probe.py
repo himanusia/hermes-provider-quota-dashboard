@@ -182,10 +182,14 @@ def pool_selection(provider: str, model: str | None) -> dict | None:
     selector, not from a local reimplementation.
 
     Read-only, twice over. ``load_pool()`` is NOT used: it seeds rows from
-    singletons and from env (``_seed_from_env`` upserts the key and persists,
-    which would rewrite auth.json behind the user's back). The pool is built
-    straight from the rows already on disk, its ``_persist`` is stubbed, and
-    ``refresh=False`` keeps every token-refresh write path out of play.
+    singletons and from env and then PERSISTS them (``_seed_from_env`` upserts
+    the key; its single-use-grant heal forks rows), which would rewrite
+    auth.json behind the user's back. Instead the rows on disk are hydrated
+    in memory with the same two seeders the runtime uses -- an ``env:VAR`` row
+    stores no token, only a ``secret_fingerprint``, so without hydration every
+    env-backed provider (commandcode, gemini, openai-api, opencode-go, ...)
+    would look empty -- and the pool's ``_persist`` is stubbed, so neither the
+    hydration nor a selection can write anything.
 
     Returns ``None`` for a provider without pool rows, else a dict with the
     pool's pick, its strategy, and a per-fingerprint verdict.
@@ -195,6 +199,8 @@ def pool_selection(provider: str, model: str | None) -> dict | None:
             CredentialPool,
             PooledCredential,
             _exhausted_until,
+            _seed_from_env,
+            _seed_from_singletons,
             get_pool_strategy,
             model_cooldown_until,
             read_credential_pool,
@@ -215,6 +221,15 @@ def pool_selection(provider: str, model: str | None) -> dict | None:
             continue
     if not entries:
         return None
+
+    try:
+        # Same hydration the runtime gets on load, minus every write. Failures
+        # only cost a row its live token, so a broken seed must not kill the
+        # whole verdict.
+        _seed_from_singletons(provider, entries)
+        _seed_from_env(provider, entries)
+    except Exception:
+        pass
 
     try:
         pool = CredentialPool(provider, entries)
@@ -256,7 +271,11 @@ def pool_selection(provider: str, model: str | None) -> dict | None:
         "strategy": get_pool_strategy(provider),
         "total": len(pool._entries),
         "available": len(available),
-        "state": "ok" if active_fp else "empty",
+        # "empty" means the pool can serve NOTHING for this model — a hard
+        # failure worth surfacing. A servable pool whose pick the account list
+        # cannot show is still "ok": claiming "no credential" there would be a
+        # false alarm.
+        "state": "empty" if not available else "ok",
         "rows": rows,
         "_active_fp": active_fp,
     }

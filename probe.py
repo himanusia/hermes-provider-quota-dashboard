@@ -1214,7 +1214,13 @@ def _probe_claude(account: dict, live) -> dict:
     return row
 
 
-ANTIGRAVITY_DEFAULT_BASE = "https://cloudcode-pa.googleapis.com/v1internal"
+# agy reads its own quota from the "daily" host (verified in agy's cli.log:
+# POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary).
+# The plain cloudcode-pa host answers 200 but reports stale/zero numbers for
+# third-party groups - Claude/GPT read 0% used while the daily host showed the
+# real 100% used. Prefer daily, fall back to the plain host only if it fails.
+ANTIGRAVITY_DEFAULT_BASE = "https://daily-cloudcode-pa.googleapis.com/v1internal"
+ANTIGRAVITY_FALLBACK_BASE = "https://cloudcode-pa.googleapis.com/v1internal"
 
 
 def antigravity_accounts() -> list:
@@ -1310,8 +1316,20 @@ def _probe_antigravity(account: dict, live) -> dict:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                "Accept": "application/json", "User-Agent": "antigravity"}
     try:
-        load = httpx.post(base + ":loadCodeAssist", headers=headers,
-                          json={"metadata": {"ideType": "ANTIGRAVITY"}}, timeout=TIMEOUT)
+        bases = [base] + ([ANTIGRAVITY_FALLBACK_BASE] if base != ANTIGRAVITY_FALLBACK_BASE else [])
+        load = None
+        for candidate in bases:
+            try:
+                load = httpx.post(candidate + ":loadCodeAssist", headers=headers,
+                                  json={"metadata": {"ideType": "ANTIGRAVITY"}}, timeout=TIMEOUT)
+            except Exception:
+                continue
+            if load.status_code == 200:
+                base = candidate
+                break
+        if load is None:
+            row["error"] = "loadCodeAssist unreachable"
+            return row
         if load.status_code in (401, 403):
             row["error"] = f"HTTP {load.status_code} - login rejected; sign in again with agy"
             return row
@@ -1324,8 +1342,12 @@ def _probe_antigravity(account: dict, live) -> dict:
         project = info.get("cloudaicompanionProject")
         # retrieveUserQuotaSummary is what agy's own quota view reads: model
         # groups (Gemini; Claude + GPT-OSS), each with a 5h and a weekly bucket.
+        # The quota read must come from the SAME host that answered auth, or the
+        # numbers belong to a different (stale) backend.
         summary = httpx.post(base + ":retrieveUserQuotaSummary", headers=headers,
                              json={"project": project} if project else {}, timeout=TIMEOUT)
+        if summary.status_code == 200 and base != ANTIGRAVITY_DEFAULT_BASE:
+            row["notes"].append(f"quota host fallback: {base.split('//')[1].split('/')[0]}")
         if summary.status_code == 429:
             row["error"] = "HTTP 429 - quota endpoint rate-limited; retry in a minute"
             return row

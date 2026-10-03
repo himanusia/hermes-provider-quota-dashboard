@@ -163,61 +163,195 @@ def accounts_for(provider: str, env_var: str, default_base: str) -> list:
     return accounts
 
 
-def pool_active_fp(provider: str) -> str | None:
-    """Fingerprint of the pool credential the provider would serve next.
+def entry_fp(entry) -> str:
+    """Fingerprint of a pool entry's live token (same recipe as ``pool_rows``)."""
+    token = resolve_ref(
+        getattr(entry, "runtime_api_key", "") or getattr(entry, "access_token", "") or ""
+    )
+    return sha(token)[:12] if token else ""
 
-    Read-only: rows are ranked exactly like ``CredentialPool.select()`` — the
-    lowest ``priority`` among non-DEAD rows wins — so the plugin can flag the
-    live account from auth.json alone. The probe never selects, refreshes, or
-    writes a credential.
+
+def pool_selection(provider: str, model: str | None) -> dict | None:
+    """Ask the credential pool which row it would serve for *model*.
+
+    Ranking by ``priority`` is NOT the pool's rule: a provider can be configured
+    ``least_used`` (``credential_pool_strategies``), and either way a
+    per-(credential, model) cooldown benches one key for one model while its
+    siblings keep serving — a Codex ChatGPT-account model entitlement benches
+    exactly that pair for a year. So the truth comes from the pool's own
+    selector, not from a local reimplementation.
+
+    Read-only, twice over. ``load_pool()`` is NOT used: it seeds rows from
+    singletons and from env (``_seed_from_env`` upserts the key and persists,
+    which would rewrite auth.json behind the user's back). The pool is built
+    straight from the rows already on disk, its ``_persist`` is stubbed, and
+    ``refresh=False`` keeps every token-refresh write path out of play.
+
+    Returns ``None`` for a provider without pool rows, else a dict with the
+    pool's pick, its strategy, and a per-fingerprint verdict.
     """
-    best: tuple | None = None
     try:
-        from agent.credential_pool import PooledCredential, read_credential_pool
+        from agent.credential_pool import (
+            CredentialPool,
+            PooledCredential,
+            _exhausted_until,
+            get_pool_strategy,
+            model_cooldown_until,
+            read_credential_pool,
+        )
 
-        for index, raw_item in enumerate(read_credential_pool(provider) or [], 1):
-            try:
-                raw = json.loads(raw_item) if isinstance(raw_item, str) else dict(raw_item)
-            except Exception:
-                continue
-            if str(raw.get("last_status") or "") == "dead":
-                continue
-            try:
-                entry = PooledCredential.from_dict(provider, raw)
-            except Exception:
-                entry = None
-            token = resolve_ref(
-                getattr(entry, "runtime_api_key", "")
-                or raw.get("api_key", "")
-                or raw.get("access_token", "")
-            )
-            if not token:
-                continue
-            priority = getattr(entry, "priority", None)
-            if not isinstance(priority, int):
-                priority = raw.get("priority")
-            priority = priority if isinstance(priority, int) else 0
-            key = (priority, index)
-            if best is None or key < best[0]:
-                best = (key, sha(token)[:12])
+        raw_rows = read_credential_pool(provider) or []
     except Exception:
         return None
-    return best[1] if best else None
+    if not raw_rows:
+        return None
+
+    entries = []
+    for raw_item in raw_rows:
+        try:
+            payload = json.loads(raw_item) if isinstance(raw_item, str) else dict(raw_item)
+            entries.append(PooledCredential.from_dict(provider, payload))
+        except Exception:
+            continue
+    if not entries:
+        return None
+
+    try:
+        pool = CredentialPool(provider, entries)
+        pool._persist = lambda *a, **k: None  # read-only guard: selection never writes
+        available, _pending = pool._available_entries(clear_expired=True, refresh=False, model=model)
+        pick, _pending = pool._select_unlocked(refresh=False, count=False, model=model)
+    except Exception:
+        return None
+
+    available_ids = {item.id for item in available}
+    rows: dict = {}
+    for entry in pool._entries:
+        fp = entry_fp(entry)
+        if not fp:
+            continue
+        status = str(getattr(entry, "last_status", "") or "")
+        until = None
+        if entry.id in available_ids:
+            verdict = "available"
+        elif status == "dead":
+            verdict = "dead"
+        else:
+            until = model_cooldown_until(entry, model)
+            if until is not None:
+                verdict = "model_benched"
+            elif status == "exhausted":
+                verdict = "exhausted"
+                try:
+                    until = _exhausted_until(entry, sole_credential=pool._is_sole_credential())
+                except Exception:
+                    until = None
+            else:
+                verdict = "skipped"
+        rows[fp] = {"verdict": verdict, "until": local_iso(until)}
+
+    active_fp = entry_fp(pick) if pick is not None else None
+    return {
+        "model": model,
+        "strategy": get_pool_strategy(provider),
+        "total": len(pool._entries),
+        "available": len(available),
+        "state": "ok" if active_fp else "empty",
+        "rows": rows,
+        "_active_fp": active_fp,
+    }
 
 
-def active_fp_for(provider: str, accounts: list) -> str | None:
-    """Which resolved account the provider is currently using, as a fingerprint.
+def active_fp_for(provider: str, accounts: list, model: str | None = None) -> dict:
+    """The live credential for *provider* under *model*, plus the pool verdict.
 
-    Pool providers pick the credential the pool would serve next. Providers
-    without a pool (Claude / Antigravity OAuth logins, one keychain login each)
-    fall back to their first resolved account — the one the session logs in with.
+    Pool providers report the credential the pool would serve next. Providers
+    without a pool (Claude / Antigravity keychain logins, one login each) fall
+    back to their first resolved account — the one the session logs in with.
+
+    A pooled provider whose pool is EMPTY for *model* reports no active account
+    at all: falling back to the first row would name a credential the pool
+    refuses to serve.
     """
     if not accounts:
-        return None
-    fp = pool_active_fp(provider)
-    if fp and any(account["fp"] == fp for account in accounts):
-        return fp
-    return accounts[0]["fp"]
+        return {"fp": None, "pool": None}
+    selection = pool_selection(provider, model)
+    if selection is None:
+        return {
+            "fp": accounts[0]["fp"],
+            "pool": {
+                "model": model, "strategy": None, "total": 0, "available": 0,
+                "state": "no_pool", "rows": {},
+            },
+        }
+    active_fp = selection.pop("_active_fp", None)
+    if active_fp and not any(account["fp"] == active_fp for account in accounts):
+        # A pool row whose token the probe could not resolve: the pool would
+        # serve it, but no account row can show its quota, so claim none.
+        active_fp = None
+    return {"fp": active_fp, "pool": selection}
+
+
+def session_scope(cfg) -> tuple:
+    """(provider, model) the profile would run with, from ``config.yaml``."""
+    block = cfg.get("model") if isinstance(cfg, dict) else None
+    if not isinstance(block, dict):
+        return None, None
+    provider = block.get("provider") if isinstance(block.get("provider"), str) else None
+    for key in ("model", "name"):
+        value = block.get(key)
+        if isinstance(value, str) and value.strip():
+            return provider, value.strip()
+    return provider, None
+
+
+def configured_model_pairs(cfg) -> dict:
+    """provider -> models, from every ``{provider: X, model: Y}`` pair in config.
+
+    The pool benches a (credential, model) pair, so the scope model has to be
+    the model that provider would actually be called with. With no explicit
+    scope, the session's own model wins for its provider and the provider's
+    first configured model is the fallback.
+    """
+    pairs: dict = {}
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            provider, model = node.get("provider"), node.get("model")
+            if isinstance(provider, str) and isinstance(model, str) and provider.strip() and model.strip():
+                pairs.setdefault(provider.strip(), [])
+                if model.strip() not in pairs[provider.strip()]:
+                    pairs[provider.strip()].append(model.strip())
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(cfg)
+    return pairs
+
+
+def scope_model_for(provider: str, explicit: str | None, session_provider: str | None,
+                    session_model: str | None, pairs: dict) -> str | None:
+    """Which model to scope the pool verdict by, for *provider*."""
+    if explicit:
+        return explicit
+    if session_model and provider == session_provider:
+        return session_model
+    models = pairs.get(provider) or []
+    return models[0] if models else None
+
+
+def config_snapshot() -> dict:
+    """Load config.yaml read-only; {} when unavailable (scope falls back to None)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
 
 
 def jwt_claims(token: str) -> dict:
@@ -1486,6 +1620,7 @@ def parse_filters(argv):
     parser.add_argument("--router-part", choices=("all", "summary", "routes"), default="all")
     parser.add_argument("--route-offset", type=int, default=0)
     parser.add_argument("--route-limit", type=int, default=12)
+    parser.add_argument("--model", default=None, help="Scope pool verdicts to this model")
     args, _ = parser.parse_known_args(argv)
     providers = {p.strip() for p in args.provider if p.strip()}
     accounts: dict = {}
@@ -1496,14 +1631,20 @@ def parse_filters(argv):
     routers = {router.strip().lower() for router in args.router if router.strip()}
     route_offset = max(0, args.route_offset)
     route_limit = max(1, min(ROUTER_ROUTE_PAGE_MAX, args.route_limit))
-    return providers, accounts, routers, args.router_part, route_offset, route_limit
+    return providers, accounts, routers, args.router_part, route_offset, route_limit, (args.model or None)
 
 
 def main() -> int:
     started = time.time()
-    only_providers, account_filters, only_routers, router_part, route_offset, route_limit = parse_filters(sys.argv[1:])
+    only_providers, account_filters, only_routers, router_part, route_offset, route_limit, explicit_model = parse_filters(sys.argv[1:])
     wanted = set(only_providers) | set(account_filters)
     router_only = bool(only_routers)
+
+    # The pool benches a (credential, model) pair, so a verdict only means
+    # something next to the model the provider would be called with.
+    config = config_snapshot()
+    session_provider, session_model = session_scope(config)
+    model_pairs = configured_model_pairs(config)
 
     jobs = []
     per_provider = {}
@@ -1590,13 +1731,25 @@ def main() -> int:
         if pid not in per_provider:
             continue
         accounts = per_provider[pid]
-        active_fp = active_fp_for(pid, accounts)
+        scope_model = scope_model_for(pid, explicit_model, session_provider, session_model, model_pairs)
+        selection = active_fp_for(pid, accounts, scope_model)
+        active_fp = selection["fp"]
+        verdicts = (selection["pool"] or {}).get("rows") or {}
         rows = []
         for account in accounts:
             row = {**normalize_row(results.get((pid, account["fp"]))), "fp": account["fp"]}
             row["is_active"] = bool(active_fp) and account["fp"] == active_fp
+            verdict = verdicts.get(account["fp"])
+            if verdict:
+                row["verdict"] = verdict["verdict"]
+                if verdict.get("until"):
+                    row["cooldown_until"] = verdict["until"]
             rows.append(row)
         entry = {"id": pid, "name": provider["name"], "accounts": rows}
+        if selection["pool"] is not None:
+            # Whether the pool can serve at all — an empty pool is a hard
+            # failure, not a healthy-looking row of quota numbers.
+            entry["pool"] = selection["pool"]
         active_account = next((a for a in accounts if a["fp"] == active_fp), None)
         if active_account is not None:
             # The UI shows only the live account in space-constrained surfaces;

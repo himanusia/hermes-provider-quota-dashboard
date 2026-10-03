@@ -575,8 +575,11 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
         load = {"paidTier": {"name": "Google AI Pro"}, "cloudaicompanionProject": "p-1"}
         seen = []
 
+        urls = []
+
         def post(url, headers=None, json=None, timeout=None):
             seen.append(url.rsplit(":", 1)[-1])
+            urls.append(url)
             return self.Response(200, load if url.endswith(":loadCodeAssist") else summary)
 
         account = {"label": "agy", "token": "agy-token", "base": "", "fp": "cafe00000000",
@@ -584,6 +587,9 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
         with patch.object(probe.httpx, "post", post):
             row = probe.probe_antigravity(account)
         self.assertEqual(seen, ["loadCodeAssist", "retrieveUserQuotaSummary"])
+        # The daily host is what agy itself reads; the plain host reports stale
+        # zeros for the Claude/GPT group.
+        self.assertTrue(all(u.startswith("https://daily-cloudcode-pa.googleapis.com/") for u in urls), urls)
         self.assertIsNone(row["error"])
         self.assertEqual(row["plan"], "Google AI Pro")
         self.assertEqual([(w["k"], w["group"], w["pct"]) for w in row["windows"]], [
@@ -591,6 +597,24 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
             ("Claude/GPT 5h", "Claude/GPT", 80.0), ("Claude/GPT weekly", "Claude/GPT", 25.0)])
         self.assertEqual(row["windows"][0]["note"], "Gemini Flash, Gemini Pro")
         self.assertNotIn("agy-token", json.dumps(row))
+
+    def test_antigravity_falls_back_host_with_a_note(self):
+        summary = {"groups": [{"displayName": "Claude and GPT models", "buckets": [
+            {"window": "5h", "remainingFraction": 0.1}, {"window": "weekly", "remainingFraction": 0.6}]}]}
+        load = {"paidTier": {"name": "Google AI Pro"}}
+
+        def post(url, headers=None, json=None, timeout=None):
+            if "daily-" in url:
+                raise probe.httpx.ConnectError("daily host down")
+            return self.Response(200, load if url.endswith(":loadCodeAssist") else summary)
+
+        account = {"label": "agy", "token": "t", "base": "", "fp": "f00d00000000",
+                   "expires": "2099-01-01T00:00:00+00:00"}
+        with patch.object(probe.httpx, "post", post):
+            row = probe.probe_antigravity(account)
+        self.assertIsNone(row["error"])
+        self.assertEqual([w["pct"] for w in row["windows"]], [90.0, 40.0])
+        self.assertTrue(any(n.startswith("quota host fallback:") for n in row["notes"]), row["notes"])
 
     def test_antigravity_expired_token_is_never_refreshed(self):
         calls = []

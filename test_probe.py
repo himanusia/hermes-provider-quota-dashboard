@@ -686,19 +686,53 @@ def fake_entry(entry_id, token, status="ok"):
 class ActiveAccountTests(unittest.TestCase):
     """The active account is what the pool's own selector would serve."""
 
-    def load(self, pool, rows=None):
+    def load(self, pool, rows=None, seed_env=None):
         """Wire pool_selection to *pool* without touching the real auth store."""
         raw = rows if rows is not None else [{"id": "x"}]
-        for target, value in (
-            (patch("agent.credential_pool.read_credential_pool", return_value=raw), None),
-            (patch("agent.credential_pool.PooledCredential.from_dict",
-                   new=lambda provider, payload: payload), None),
-            (patch("agent.credential_pool.CredentialPool",
-                   new=lambda provider, entries: pool), None),
+        for target in (
+            patch("agent.credential_pool.read_credential_pool", return_value=raw),
+            patch("agent.credential_pool.PooledCredential.from_dict",
+                  new=lambda provider, payload: payload),
+            patch("agent.credential_pool._seed_from_singletons",
+                  new=lambda provider, entries: (False, set())),
+            patch("agent.credential_pool._seed_from_env",
+                  new=seed_env or (lambda provider, entries: (False, set()))),
+            patch("agent.credential_pool.CredentialPool",
+                  new=lambda provider, entries: pool),
         ):
             target.start()
             self.addCleanup(target.stop)
         return pool
+
+    def test_env_backed_rows_are_hydrated_in_memory(self):
+        # An `env:VAR` row stores no token on disk, only a secret_fingerprint.
+        # Without the runtime's seeding every env-backed provider (commandcode,
+        # gemini, openai-api, opencode-go) looks EMPTY and the pane announces
+        # "no credential" for a provider that is perfectly healthy (#regression).
+        row = {"id": "e1", "label": "COMMANDCODE_API_KEY", "auth_type": "api_key",
+               "priority": 0, "source": "env:COMMANDCODE_API_KEY", "secret_fingerprint": "sha256:x"}
+        hydrated = fake_entry("e1", "tok-env")
+        pool = FakePool([hydrated], [hydrated], hydrated)
+
+        def seed(provider, entries):
+            entries.append(hydrated)  # what _seed_from_env does: token lands in memory only
+            return True, {"env:COMMANDCODE_API_KEY"}
+
+        self.load(pool, rows=[row], seed_env=seed)
+        selection = probe.pool_selection("commandcode", "deepseek/deepseek-v4.1-flash")
+        self.assertEqual(selection["state"], "ok")
+        self.assertEqual(selection["_active_fp"], probe.sha("tok-env")[:12])
+
+    def test_servable_pool_is_not_called_empty_when_the_pick_is_unresolvable(self):
+        # state=empty means "the pool serves nothing" — never "the one account
+        # list we have cannot show the pick".
+        accounts = [{"fp": "aaa", "label": "one"}]
+        with patch.object(probe, "pool_selection", return_value={
+                "state": "ok", "available": 1, "total": 2, "strategy": "least_used",
+                "model": "m", "rows": {}, "_active_fp": "zzz"}):
+            result = probe.active_fp_for("openai-codex", accounts, "m")
+        self.assertIsNone(result["fp"])
+        self.assertEqual(result["pool"]["state"], "ok")
 
     def test_pool_less_provider_returns_none(self):
         with patch("agent.credential_pool.read_credential_pool", return_value=[]):

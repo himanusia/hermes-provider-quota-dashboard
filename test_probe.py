@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -507,6 +508,10 @@ class ClaudeSubscriptionProbeTests(unittest.TestCase):
         self.assertIn("account.is_active", source)
         self.assertIn("active_account", source)
         self.assertIn("ActiveAccountPanel", source)
+        # A credential the pool benches and a pool with nothing servable both
+        # have to be visible, not silently rendered as healthy quota.
+        self.assertIn("model_benched", source)
+        self.assertIn("no credential", source)
 
 
 class SnapshotAndAntigravityTests(unittest.TestCase):
@@ -650,43 +655,139 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
         self.assertEqual([a["token"] for a in accounts], ["kc-token"])
 
 
+class FakePool:
+    """Stand-in for ``CredentialPool`` recording what the probe asked of it."""
+
+    def __init__(self, entries, available, pick):
+        self._entries = entries
+        self._available = available
+        self._pick = pick
+        self.persisted = False
+
+    def _persist(self, *args, **kwargs):  # must be replaced by the read-only guard
+        self.persisted = True
+
+    def _available_entries(self, **kwargs):
+        self.asked = kwargs
+        return self._available, []
+
+    def _select_unlocked(self, **kwargs):
+        self.select_kwargs = kwargs
+        return self._pick, []
+
+    def _is_sole_credential(self):
+        return len(self._entries) == 1
+
+
+def fake_entry(entry_id, token, status="ok"):
+    return type("E", (), {"id": entry_id, "last_status": status, "runtime_api_key": token})()
+
+
 class ActiveAccountTests(unittest.TestCase):
-    """The active account is the credential the pool would serve next."""
+    """The active account is what the pool's own selector would serve."""
 
-    @staticmethod
-    def fake_entry(priority, key):
-        return type("E", (), {"priority": priority, "runtime_api_key": key})()
+    def load(self, pool, rows=None):
+        """Wire pool_selection to *pool* without touching the real auth store."""
+        raw = rows if rows is not None else [{"id": "x"}]
+        for target, value in (
+            (patch("agent.credential_pool.read_credential_pool", return_value=raw), None),
+            (patch("agent.credential_pool.PooledCredential.from_dict",
+                   new=lambda provider, payload: payload), None),
+            (patch("agent.credential_pool.CredentialPool",
+                   new=lambda provider, entries: pool), None),
+        ):
+            target.start()
+            self.addCleanup(target.stop)
+        return pool
 
-    def test_pool_active_fp_takes_lowest_priority_and_skips_dead(self):
-        rows = [
-            {"id": "b", "label": "backup", "priority": 2, "api_key": "tok-b", "last_status": "ok"},
-            {"id": "a", "label": "primary", "priority": 0, "api_key": "tok-a", "last_status": "ok"},
-            {"id": "d", "label": "dead", "priority": 0, "api_key": "tok-d", "last_status": "dead"},
-        ]
-        entry = ActiveAccountTests.fake_entry
-        with patch("agent.credential_pool.read_credential_pool", return_value=rows), \
-             patch("agent.credential_pool.PooledCredential.from_dict",
-                   new=lambda provider, raw: entry(raw.get("priority"), raw.get("api_key", ""))):
-            fp = probe.pool_active_fp("openai-codex")
-        # The DEAD row also has priority 0 but is skipped, so the primary wins.
-        self.assertEqual(fp, probe.sha("tok-a")[:12])
-
-    def test_pool_active_fp_is_none_without_a_usable_row(self):
+    def test_pool_less_provider_returns_none(self):
         with patch("agent.credential_pool.read_credential_pool", return_value=[]):
-            self.assertIsNone(probe.pool_active_fp("openai-codex"))
+            self.assertIsNone(probe.pool_selection("claude-subscription", None))
 
-    def test_active_account_prefers_the_pool_pick_then_the_first_row(self):
+    def test_selection_is_read_only(self):
+        entries = [fake_entry("a", "tok-a")]
+        pool = self.load(FakePool(entries, entries, entries[0]))
+        selection = probe.pool_selection("openai-codex", "gpt-6-luna-900k")
+        self.assertFalse(pool.persisted, "selection must not write auth.json")
+        self.assertFalse(pool.select_kwargs.get("count"), "selection must not bump request_count")
+        self.assertFalse(pool.asked.get("refresh"), "selection must not refresh tokens")
+        self.assertEqual(selection["_active_fp"], probe.sha("tok-a")[:12])
+
+    def test_pick_comes_from_the_pool_not_from_priority(self):
+        # least_used: the pool picked the low-request_count row even though a
+        # higher-priority sibling exists — priority ranking would be wrong here.
+        rows = [fake_entry("p0", "tok-primary"), fake_entry("p1", "tok-live")]
+        pool = self.load(FakePool(rows, rows, rows[1]))
+        selection = probe.pool_selection("openai-codex", "gpt-6-luna-900k")
+        self.assertEqual(selection["_active_fp"], probe.sha("tok-live")[:12])
+        self.assertEqual(selection["state"], "ok")
+        self.assertEqual(selection["available"], 2)
+
+    def test_empty_pool_for_a_benched_model_claims_no_active_account(self):
+        rows = [fake_entry("a", "tok-a"), fake_entry("b", "tok-b")]
+        pool = self.load(FakePool(rows, [], None))  # available=[] -> no pick
+        with patch("agent.credential_pool.model_cooldown_until", return_value=1893456000.0):
+            selection = probe.pool_selection("openai-codex", "coding-safe")
+        self.assertIsNone(selection["_active_fp"])
+        self.assertEqual(selection["state"], "empty")
+        self.assertEqual({v["verdict"] for v in selection["rows"].values()}, {"model_benched"})
+        self.assertTrue(all(v["until"] for v in selection["rows"].values()))
+
+    def test_verdicts_distinguish_dead_and_exhausted(self):
+        rows = [fake_entry("a", "tok-a"), fake_entry("d", "tok-d", "dead"), fake_entry("e", "tok-e", "exhausted")]
+        pool = self.load(FakePool(rows, rows[:1], rows[0]))
+        with patch("agent.credential_pool.model_cooldown_until", return_value=None), \
+             patch("agent.credential_pool._exhausted_until", return_value=None):
+            selection = probe.pool_selection("openai-codex", "m")
+        verdicts = {fp: v["verdict"] for fp, v in selection["rows"].items()}
+        self.assertEqual(verdicts[probe.sha("tok-a")[:12]], "available")
+        self.assertEqual(verdicts[probe.sha("tok-d")[:12]], "dead")
+        self.assertEqual(verdicts[probe.sha("tok-e")[:12]], "exhausted")
+
+    def test_active_account_reports_pool_less_and_empty_pools_differently(self):
         accounts = [{"fp": "aaa", "label": "one"}, {"fp": "bbb", "label": "two"}]
-        with patch.object(probe, "pool_active_fp", return_value="bbb"):
-            self.assertEqual(probe.active_fp_for("openai-codex", accounts), "bbb")
-        # A pool pick that is not among the resolved accounts (e.g. an env-only
-        # row the probe could not resolve) falls back to the first account, as
-        # does a pool-less provider such as Antigravity.
-        with patch.object(probe, "pool_active_fp", return_value="zzz"):
-            self.assertEqual(probe.active_fp_for("openai-codex", accounts), "aaa")
-        with patch.object(probe, "pool_active_fp", return_value=None):
-            self.assertEqual(probe.active_fp_for("antigravity-subscription", accounts), "aaa")
-        self.assertIsNone(probe.active_fp_for("openai-codex", []))
+        # No pool rows: the singleton login IS the live credential.
+        with patch.object(probe, "pool_selection", return_value=None):
+            result = probe.active_fp_for("claude-subscription", accounts, "m")
+        self.assertEqual(result["fp"], "aaa")
+        self.assertEqual(result["pool"]["state"], "no_pool")
+        # Pool rows but nothing servable for this model: name nobody.
+        with patch.object(probe, "pool_selection",
+                          return_value={"state": "empty", "available": 0, "total": 2,
+                                        "strategy": "least_used", "model": "m", "rows": {},
+                                        "_active_fp": None}):
+            result = probe.active_fp_for("openai-codex", accounts, "m")
+        self.assertIsNone(result["fp"])
+        self.assertEqual(result["pool"]["state"], "empty")
+        self.assertIsNone(probe.active_fp_for("openai-codex", [], "m")["fp"])
+
+    def test_scope_model_prefers_session_then_the_provider_pair(self):
+        pairs = {"openai-codex": ["gpt-6-luna-900k", "gpt-image-2-high"], "commandcode": ["deepseek/x"]}
+        self.assertEqual(probe.scope_model_for("openai-codex", None, "antigravity", "gemini", pairs),
+                         "gpt-6-luna-900k")
+        # The session model wins for the provider the session actually runs on.
+        self.assertEqual(probe.scope_model_for("antigravity", None, "antigravity", "gemini", pairs), "gemini")
+        self.assertEqual(probe.scope_model_for("openai-codex", "coding-safe", "antigravity", "gemini", pairs),
+                         "coding-safe")
+        self.assertIsNone(probe.scope_model_for("nous", None, None, None, pairs))
+
+    def test_config_pairs_are_collected_from_nested_blocks(self):
+        cfg = {"moa": {"reference_models": [{"provider": "openai-codex", "model": "gpt-6-luna-900k"}]},
+               "image_gen": {"provider": "openai-codex", "model": "gpt-image-2-high"},
+               "model": {"provider": "antigravity"}}
+        pairs = probe.configured_model_pairs(cfg)
+        self.assertEqual(pairs["openai-codex"], ["gpt-6-luna-900k", "gpt-image-2-high"])
+        self.assertNotIn("antigravity", pairs)  # no model in that block
+
+    def test_real_selection_leaves_auth_json_untouched(self):
+        """Integration: the real pool selector runs against the real auth.json."""
+        path = Path(os.path.expanduser("~/.hermes/auth.json"))
+        if not path.exists():
+            self.skipTest("no auth.json on this machine")
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+        probe.pool_selection("openai-codex", "coding-safe")
+        probe.pool_selection("openrouter", None)
+        self.assertEqual(before, hashlib.sha256(path.read_bytes()).hexdigest())
 
 
 if __name__ == "__main__":

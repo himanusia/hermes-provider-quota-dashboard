@@ -335,6 +335,16 @@ function WindowRow({ window: w }) {
   })
 }
 
+// Pool verdicts in the pane's own words. ``model_benched`` is a
+// per-(credential, model) entitlement or rate-limit bench: the credential
+// serves other models fine, so it must not read as a broken row.
+const VERDICT_LABEL = {
+  model_benched: 'benched',
+  exhausted: 'rate-limited',
+  dead: 'dead',
+  skipped: 'unusable'
+}
+
 function AccountCard({ account, sharedCreds, busy, onRefresh, active }) {
   const prefs = useValue($prefs)
   const notes = prefs.notes ? account.notes || [] : []
@@ -342,6 +352,8 @@ function AccountCard({ account, sharedCreds, busy, onRefresh, active }) {
   const creds = sharedCreds || []
   const merged = creds.length > 1
   const title = merged ? creds.map(cred => cred.label).join(' · ') : account.label
+  const verdict = account.verdict
+  const verdictLabel = verdict && verdict !== 'available' ? VERDICT_LABEL[verdict] || verdict : null
 
   return jsxs('div', {
     className: cn('flex flex-col gap-2 rounded-md border p-2',
@@ -355,6 +367,16 @@ function AccountCard({ account, sharedCreds, busy, onRefresh, active }) {
             children: title
           }),
           active ? jsx(Badge, { variant: 'muted', size: 'xs', children: 'active' }) : null,
+          // A credential the pool will not serve for the scoped model cannot be
+          // mistaken for a usable backup.
+          verdictLabel
+            ? jsx(Badge, {
+                variant: 'muted',
+                size: 'xs',
+                title: account.cooldown_until ? `until ${String(account.cooldown_until).slice(0, 10)}` : undefined,
+                children: verdictLabel
+              })
+            : null,
           account.plan && prefs.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: account.plan }) : null,
           jsx(RefreshButton, { busy, onRefresh, label: merged ? 'Refresh all credentials' : `Refresh ${account.label}` })
         ]
@@ -388,7 +410,9 @@ function AccountCard({ account, sharedCreds, busy, onRefresh, active }) {
 
 // The list above shows every credential; the bottom panel answers the other
 // question — "which account is Hermes using right now?" — one row per provider,
-// so a rotating pool never buries the live credential among its backups.
+// so a rotating pool never buries the live credential among its backups. A pool
+// that can serve NOTHING for the scoped model gets a row too: silently dropping
+// it would hide a hard failure behind a healthy-looking provider list.
 function ActiveAccountPanel({ providers }) {
   const prefs = useValue($prefs)
   const rows = []
@@ -396,12 +420,18 @@ function ActiveAccountPanel({ providers }) {
   for (const provider of providers || []) {
     const accounts = provider.accounts || []
     const hint = provider.active_account || {}
-    const active = accounts.find(account => account.is_active)
-      || accounts.find(account => account.fp && account.fp === hint.fp)
-      || (accounts.length === 1 ? accounts[0] : null)
+    const pool = provider.pool || {}
+    // A benched credential is not a candidate: it is exactly what the pool skips.
+    const servable = accounts.filter(account => !account.verdict || account.verdict === 'available')
+    const active = servable.find(account => account.is_active)
+      || servable.find(account => account.fp && account.fp === hint.fp)
+      || (servable.length === 1 ? servable[0] : null)
 
     if (active) {
       rows.push({ provider, account: active })
+    } else if (accounts.length) {
+      const blocked = accounts.find(account => account.verdict) || {}
+      rows.push({ provider, account: null, blocked })
     }
   }
 
@@ -416,42 +446,67 @@ function ActiveAccountPanel({ providers }) {
         className: 'flex items-center gap-1.5',
         children: [
           jsx('div', { className: 'min-w-0 flex-1 truncate text-xs font-medium', children: 'Active accounts' }),
-          jsx(Badge, { variant: 'outline', size: 'xs', children: String(rows.length) })
+          jsx(Badge, { variant: 'outline', size: 'xs', children: String(rows.filter(row => row.account).length) })
         ]
       }),
       jsx('div', {
         className: 'text-[0.65rem] text-(--ui-text-quaternary)',
         children: 'The credential each provider is serving right now'
       }),
-      ...rows.map(({ provider, account }) =>
+      ...rows.map(({ provider, account, blocked }) =>
         jsxs(
           'div',
           {
             className: 'flex flex-col gap-1.5 rounded border border-(--ui-stroke-secondary) p-1.5',
-            children: [
-              jsxs('div', {
-                className: 'flex items-center gap-1.5',
-                children: [
-                  jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.7rem] font-medium', children: provider.name }),
-                  jsx('span', {
-                    className: 'min-w-0 truncate text-[0.7rem] text-(--ui-text-secondary)',
-                    children: account.label || account.fp || 'default'
+            children: account
+              ? [
+                  jsxs('div', {
+                    className: 'flex items-center gap-1.5',
+                    children: [
+                      jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.7rem] font-medium', children: provider.name }),
+                      jsx('span', {
+                        className: 'min-w-0 truncate text-[0.7rem] text-(--ui-text-secondary)',
+                        children: account.label || account.fp || 'default'
+                      }),
+                      account.plan && prefs.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: account.plan }) : null
+                    ]
                   }),
-                  account.plan && prefs.plan ? jsx(Badge, { variant: 'muted', size: 'xs', children: account.plan }) : null
+                  (account.windows || []).length
+                    ? jsxs('div', {
+                        className: 'flex flex-col gap-1.5',
+                        children: (account.windows || []).map(w => jsx(WindowRow, { window: w, key: w.k }))
+                      })
+                    : jsx('div', {
+                        className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+                        children: account.error ? `⚠ ${account.error}` : 'no quota window'
+                      })
                 ]
-              }),
-              (account.windows || []).length
-                ? jsxs('div', {
-                    className: 'flex flex-col gap-1.5',
-                    children: (account.windows || []).map(w => jsx(WindowRow, { window: w, key: w.k }))
+              : [
+                  jsxs('div', {
+                    className: 'flex items-center gap-1.5',
+                    children: [
+                      jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.7rem] font-medium', children: provider.name }),
+                      jsx(Badge, { variant: 'muted', size: 'xs', children: 'no credential' })
+                    ]
+                  }),
+                  jsx('div', {
+                    className: 'text-[0.65rem] text-(--ui-text-tertiary)',
+                    children: [
+                      blocked.verdict === 'model_benched' && provider.pool && provider.pool.model
+                        ? `nothing servable for ${provider.pool.model}`
+                        : blocked.verdict === 'model_benched'
+                          ? 'every credential is benched for the scoped model'
+                          : blocked.verdict === 'exhausted'
+                            ? 'every credential is rate-limited'
+                            : blocked.verdict === 'dead'
+                              ? 'every credential is dead'
+                              : 'no credential available',
+                      blocked.cooldown_until ? ` — until ${String(blocked.cooldown_until).slice(0, 16).replace('T', ' ')}` : ''
+                    ].join('')
                   })
-                : jsx('div', {
-                    className: 'text-[0.65rem] text-(--ui-text-quaternary)',
-                    children: account.error ? `⚠ ${account.error}` : 'no quota window'
-                  })
-            ]
+                ]
           },
-          `${provider.id}|active|${account.fp || account.label}`
+          `${provider.id}|active|${account ? account.fp || account.label : 'none'}`
         )
       )
     ]

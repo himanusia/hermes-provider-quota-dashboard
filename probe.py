@@ -1433,6 +1433,18 @@ ANTIGRAVITY_DEFAULT_BASE = "https://daily-cloudcode-pa.googleapis.com/v1internal
 ANTIGRAVITY_FALLBACK_BASE = "https://cloudcode-pa.googleapis.com/v1internal"
 
 
+def antigravity_registry() -> dict:
+    """antigravity-subscription-directsdk's account registry (read-only), or {}."""
+    path = (os.environ.get("ANTIGRAVITY_ACCOUNTS_FILE") or ENV.get("ANTIGRAVITY_ACCOUNTS_FILE")
+            or os.path.join(HOME, ".hermes", "antigravity-accounts.json"))
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def antigravity_accounts() -> list:
     """agy's OAuth login, read-only (never refreshed, never written).
 
@@ -1466,11 +1478,11 @@ def antigravity_accounts() -> list:
                                   "-a", "antigravity", "-w"], capture_output=True, text=True, timeout=10)
             token = parse(out.stdout) if out.returncode == 0 else None
             if token:
-                found.append(("agy login (keychain)", token))
+                found.append(("default", token))
         except Exception:
             pass
-    dirs = [os.path.expanduser(override)] if override else [os.path.join(HOME, ".gemini", "antigravity-cli")]
-    for directory in dirs:
+
+    def read_token_dir(directory: str):
         for name in ("jetski-standalone-oauth-token", "antigravity-oauth-token"):
             try:
                 with open(os.path.join(directory, name), encoding="utf-8") as handle:
@@ -1478,7 +1490,27 @@ def antigravity_accounts() -> list:
             except Exception:
                 token = None
             if token:
-                found.append((f"agy login ({display_path(directory)})", token))
+                return token
+        return None
+
+    dirs = [os.path.expanduser(override)] if override else [os.path.join(HOME, ".gemini", "antigravity-cli")]
+    for directory in dirs:
+        token = read_token_dir(directory)
+        if token:
+            found.append(("default" if not override else f"agy login ({display_path(directory)})", token))
+    # Rotation accounts registered by antigravity-subscription-directsdk: each has
+    # its own HOME and token. The provider records which account served the last
+    # request ("serving"); that one goes first, which is the row the dock meters.
+    registry, serving = antigravity_registry(), ""
+    if registry:
+        serving = str((registry.get("serving") or {}).get("label") or "")
+        for acc in registry.get("accounts") or []:
+            if not isinstance(acc, dict) or not acc.get("enabled", True) or not acc.get("home_dir"):
+                continue
+            token = read_token_dir(os.path.join(os.path.expanduser(acc["home_dir"]), ".gemini", "antigravity-cli"))
+            if token:
+                found.append((str(acc.get("label") or acc["home_dir"]), token))
+    found.sort(key=lambda item: 0 if item[0] == (serving or "default") else 1)
     seen: set = set()
     accounts = []
     for label, token in found:

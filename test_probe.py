@@ -655,6 +655,37 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
         self.assertEqual([a["token"] for a in accounts], ["kc-token"])
 
 
+    def test_antigravity_lists_rotation_accounts_serving_first(self):
+        def token_dir(home, token):
+            directory = os.path.join(home, ".gemini", "antigravity-cli")
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, "antigravity-oauth-token"), "w") as handle:
+                json.dump({"access_token": token, "expiry": "2099-01-01T00:00:00Z"}, handle)
+
+        root = self.tmp.name
+        token_dir(root, "host-token")
+        token_dir(os.path.join(root, "acc", "work"), "work-token")
+        token_dir(os.path.join(root, "acc", "off"), "off-token")
+        registry = os.path.join(root, "accounts.json")
+        with open(registry, "w") as handle:
+            json.dump({"serving": {"label": "work"}, "accounts": [
+                {"label": "work", "home_dir": os.path.join(root, "acc", "work"), "enabled": True},
+                {"label": "off", "home_dir": os.path.join(root, "acc", "off"), "enabled": False},
+            ]}, handle)
+        env = {"HERMES_QUOTA_NO_KEYCHAIN": "1", "ANTIGRAVITY_ACCOUNTS_FILE": registry}
+        with patch.object(probe, "HOME", root), patch.object(probe, "ENV", {}), \
+                patch.dict(probe.os.environ, env, clear=False):
+            probe.os.environ.pop("ANTIGRAVITY_CONFIG_DIR", None)
+            accounts = probe.antigravity_accounts()
+            # The serving account comes first: that is the row the dock meters.
+            self.assertEqual([(a["label"], a["token"]) for a in accounts],
+                             [("work", "work-token"), ("default", "host-token")])
+            with open(registry, "w") as handle:
+                json.dump({"serving": {"label": ""}, "accounts": [
+                    {"label": "work", "home_dir": os.path.join(root, "acc", "work")}]}, handle)
+            self.assertEqual([a["label"] for a in probe.antigravity_accounts()], ["default", "work"])
+
+
 class FakePool:
     """Stand-in for ``CredentialPool`` recording what the probe asked of it."""
 

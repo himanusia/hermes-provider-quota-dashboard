@@ -163,6 +163,63 @@ def accounts_for(provider: str, env_var: str, default_base: str) -> list:
     return accounts
 
 
+def pool_active_fp(provider: str) -> str | None:
+    """Fingerprint of the pool credential the provider would serve next.
+
+    Read-only: rows are ranked exactly like ``CredentialPool.select()`` — the
+    lowest ``priority`` among non-DEAD rows wins — so the plugin can flag the
+    live account from auth.json alone. The probe never selects, refreshes, or
+    writes a credential.
+    """
+    best: tuple | None = None
+    try:
+        from agent.credential_pool import PooledCredential, read_credential_pool
+
+        for index, raw_item in enumerate(read_credential_pool(provider) or [], 1):
+            try:
+                raw = json.loads(raw_item) if isinstance(raw_item, str) else dict(raw_item)
+            except Exception:
+                continue
+            if str(raw.get("last_status") or "") == "dead":
+                continue
+            try:
+                entry = PooledCredential.from_dict(provider, raw)
+            except Exception:
+                entry = None
+            token = resolve_ref(
+                getattr(entry, "runtime_api_key", "")
+                or raw.get("api_key", "")
+                or raw.get("access_token", "")
+            )
+            if not token:
+                continue
+            priority = getattr(entry, "priority", None)
+            if not isinstance(priority, int):
+                priority = raw.get("priority")
+            priority = priority if isinstance(priority, int) else 0
+            key = (priority, index)
+            if best is None or key < best[0]:
+                best = (key, sha(token)[:12])
+    except Exception:
+        return None
+    return best[1] if best else None
+
+
+def active_fp_for(provider: str, accounts: list) -> str | None:
+    """Which resolved account the provider is currently using, as a fingerprint.
+
+    Pool providers pick the credential the pool would serve next. Providers
+    without a pool (Claude / Antigravity OAuth logins, one keychain login each)
+    fall back to their first resolved account — the one the session logs in with.
+    """
+    if not accounts:
+        return None
+    fp = pool_active_fp(provider)
+    if fp and any(account["fp"] == fp for account in accounts):
+        return fp
+    return accounts[0]["fp"]
+
+
 def jwt_claims(token: str) -> dict:
     try:
         payload = token.split(".")[1]
@@ -1527,21 +1584,30 @@ def main() -> int:
                     )
                 )
 
+    provider_payload = []
+    for provider in PROVIDERS:
+        pid = provider["id"]
+        if pid not in per_provider:
+            continue
+        accounts = per_provider[pid]
+        active_fp = active_fp_for(pid, accounts)
+        rows = []
+        for account in accounts:
+            row = {**normalize_row(results.get((pid, account["fp"]))), "fp": account["fp"]}
+            row["is_active"] = bool(active_fp) and account["fp"] == active_fp
+            rows.append(row)
+        entry = {"id": pid, "name": provider["name"], "accounts": rows}
+        active_account = next((a for a in accounts if a["fp"] == active_fp), None)
+        if active_account is not None:
+            # The UI shows only the live account in space-constrained surfaces;
+            # list views keep every account and highlight this one.
+            entry["active_account"] = {"fp": active_account["fp"], "label": active_account["label"]}
+        provider_payload.append(entry)
+
     payload = {
         "fetchedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
         "elapsedMs": int((time.time() - started) * 1000),
-        "providers": [
-            {
-                "id": provider["id"],
-                "name": provider["name"],
-                "accounts": [
-                    {**normalize_row(results.get((provider["id"], account["fp"]))), "fp": account["fp"]}
-                    for account in per_provider[provider["id"]]
-                ],
-            }
-            for provider in PROVIDERS
-            if provider["id"] in per_provider
-        ],
+        "providers": provider_payload,
         "routers": router_results,
     }
     print(SENTINEL + " " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")))

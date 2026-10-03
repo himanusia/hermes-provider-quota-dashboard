@@ -500,6 +500,14 @@ class ClaudeSubscriptionProbeTests(unittest.TestCase):
         self.assertIn("ctx.storage.get(PREFS_KEY", source)
         self.assertIn("enabledIds(PROVIDER_IDS)", source)
 
+    def test_plugin_surfaces_the_active_account(self):
+        source = (Path(__file__).parent / "plugin.js").read_text(encoding="utf-8")
+        # The list keeps every credential and flags the live one; the bottom
+        # panel is the "which account is in use" summary the dock cannot fit.
+        self.assertIn("account.is_active", source)
+        self.assertIn("active_account", source)
+        self.assertIn("ActiveAccountPanel", source)
+
 
 class SnapshotAndAntigravityTests(unittest.TestCase):
     class Response:
@@ -640,6 +648,45 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
             probe.os.environ.pop("HERMES_QUOTA_NO_KEYCHAIN", None)
             accounts = probe.antigravity_accounts()
         self.assertEqual([a["token"] for a in accounts], ["kc-token"])
+
+
+class ActiveAccountTests(unittest.TestCase):
+    """The active account is the credential the pool would serve next."""
+
+    @staticmethod
+    def fake_entry(priority, key):
+        return type("E", (), {"priority": priority, "runtime_api_key": key})()
+
+    def test_pool_active_fp_takes_lowest_priority_and_skips_dead(self):
+        rows = [
+            {"id": "b", "label": "backup", "priority": 2, "api_key": "tok-b", "last_status": "ok"},
+            {"id": "a", "label": "primary", "priority": 0, "api_key": "tok-a", "last_status": "ok"},
+            {"id": "d", "label": "dead", "priority": 0, "api_key": "tok-d", "last_status": "dead"},
+        ]
+        entry = ActiveAccountTests.fake_entry
+        with patch("agent.credential_pool.read_credential_pool", return_value=rows), \
+             patch("agent.credential_pool.PooledCredential.from_dict",
+                   new=lambda provider, raw: entry(raw.get("priority"), raw.get("api_key", ""))):
+            fp = probe.pool_active_fp("openai-codex")
+        # The DEAD row also has priority 0 but is skipped, so the primary wins.
+        self.assertEqual(fp, probe.sha("tok-a")[:12])
+
+    def test_pool_active_fp_is_none_without_a_usable_row(self):
+        with patch("agent.credential_pool.read_credential_pool", return_value=[]):
+            self.assertIsNone(probe.pool_active_fp("openai-codex"))
+
+    def test_active_account_prefers_the_pool_pick_then_the_first_row(self):
+        accounts = [{"fp": "aaa", "label": "one"}, {"fp": "bbb", "label": "two"}]
+        with patch.object(probe, "pool_active_fp", return_value="bbb"):
+            self.assertEqual(probe.active_fp_for("openai-codex", accounts), "bbb")
+        # A pool pick that is not among the resolved accounts (e.g. an env-only
+        # row the probe could not resolve) falls back to the first account, as
+        # does a pool-less provider such as Antigravity.
+        with patch.object(probe, "pool_active_fp", return_value="zzz"):
+            self.assertEqual(probe.active_fp_for("openai-codex", accounts), "aaa")
+        with patch.object(probe, "pool_active_fp", return_value=None):
+            self.assertEqual(probe.active_fp_for("antigravity-subscription", accounts), "aaa")
+        self.assertIsNone(probe.active_fp_for("openai-codex", []))
 
 
 if __name__ == "__main__":

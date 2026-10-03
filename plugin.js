@@ -1334,12 +1334,20 @@ function providerForModel(slug) {
 
 /** The most-used 5h window of a provider (worst case across its accounts);
  * falls back to any window when none is labelled 5h. */
-function fiveHourWindow(provider) {
+function fiveHourWindow(provider, model = '') {
   if (!provider) {
     return null
   }
 
-  const windows = (provider.accounts || []).flatMap(account => account.windows || [])
+  let windows = (provider.accounts || []).flatMap(account => account.windows || [])
+  // Grouped quota (Antigravity: Gemini vs Claude/GPT): meter the group the
+  // focused chat's model draws from, not whichever group is tighter.
+  const slug = String(model || '').toLowerCase()
+  const want = /claude|gpt/.test(slug) ? /claude|gpt/i : /gemini/.test(slug) ? /gemini/i : null
+  if (want && windows.some(w => w.group)) {
+    const mine = windows.filter(w => want.test(String(w.group || '')))
+    windows = mine.length ? mine : windows
+  }
   const fives = windows.filter(w => /5h|session/i.test(String(w.k || '')))
   const pool = fives.length ? fives : windows
 
@@ -1395,7 +1403,7 @@ function QuotaChip() {
   const providerId =
     PROVIDER_ALIASES[String((focused && focused.provider) || '').toLowerCase()] || providerForModel(model)
   let active = providers.find(provider => provider.id === providerId) || null
-  let five = active ? fiveHourWindow(active) : null
+  let five = active ? fiveHourWindow(active, model) : null
 
   if (!five) {
     active = null

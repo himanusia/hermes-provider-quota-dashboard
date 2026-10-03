@@ -3,8 +3,9 @@
  * https://github.com/himanusia/hermes-provider-quota-dashboard
  *
  * A desktop pane with live quota readouts for EVERY account of OpenAI Codex
- * (credential pool), OpenCode Go, and CommandCode — with refresh controls at
- * global, per-provider, and per-account granularity.
+ * (credential pool), OpenCode Go, and CommandCode — plus read-only local
+ * OmniRoute and 9router history/configuration with route explanations hidden
+ * behind collapsed details.
  *
  * Data path: probe.py runs on the backend host via the gateway's `shell.exec`
  * RPC (read-only; secrets never leave the host). The probe prints one
@@ -42,6 +43,9 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const ID = 'quota-dash'
 const QUERY_KEY = ['quota-dash', 'quotas']
 const SENTINEL = '@@QUOTA@@'
+const PROVIDER_IDS = ['openai-codex', 'opencode-go', 'commandcode']
+const ROUTER_IDS = ['omniroute', '9router']
+const ROUTE_PAGE_SIZE = 8
 
 // Runs on the backend host. Backend env can override every path:
 // HERMES_PYTHON (python), HERMES_QUOTA_PROBE (probe script), HERMES_HOME
@@ -49,10 +53,21 @@ const SENTINEL = '@@QUOTA@@'
 const PROBE_CMD =
   '/usr/bin/env -u PYTHONPATH "${HERMES_PYTHON:-$HOME/.hermes/hermes-agent/venv/bin/python}" "${HERMES_QUOTA_PROBE:-${HERMES_HOME:-$HOME/.hermes}/desktop-plugins/quota-dash/probe.py}"'
 
-function buildProbeCommand({ provider, account } = {}) {
+function buildProbeCommand({ provider, account, router, routerPart, routeOffset, routeLimit } = {}) {
   let cmd = PROBE_CMD
 
-  if (account && /^[a-z0-9-]+:[0-9a-f]{6,12}$/.test(account)) {
+  if (router && /^(omniroute|9router)$/.test(router)) {
+    cmd += ` --router ${router}`
+    if (routerPart && /^(summary|routes)$/.test(routerPart)) {
+      cmd += ` --router-part ${routerPart}`
+    }
+    if (Number.isInteger(routeOffset) && routeOffset >= 0) {
+      cmd += ` --route-offset ${routeOffset}`
+    }
+    if (Number.isInteger(routeLimit) && routeLimit >= 1 && routeLimit <= ROUTE_PAGE_SIZE) {
+      cmd += ` --route-limit ${routeLimit}`
+    }
+  } else if (account && /^[a-z0-9-]+:[0-9a-f]{6,12}$/.test(account)) {
     cmd += ` --account ${account}`
   } else if (provider && /^[a-z0-9-]+$/.test(provider)) {
     cmd += ` --provider ${provider}`
@@ -61,10 +76,11 @@ function buildProbeCommand({ provider, account } = {}) {
   return cmd
 }
 
-async function fetchQuotas(filters) {
-  // A booting backend can leave the request hanging (not just rejecting);
-  // bound it so a stuck fetch becomes a retryable failure, never an eternal
-  // skeleton that only a manual refresh clears.
+async function runProbe(filters) {
+  // Each response must stay below shell.exec's 4 KB stdout cap. Router
+  // summaries and route pages are separate; the full details are reassembled
+  // by fetchRouter() before they reach the pane.
+  // A booting backend can also hang rather than reject, so bound every RPC.
   let timer = null
   const result = await Promise.race([
     host.request('shell.exec', { command: buildProbeCommand(filters) }),
@@ -81,10 +97,98 @@ async function fetchQuotas(filters) {
       .split('\n')
       .slice(-3)
       .join(' ')
-    throw new Error(stderr || `probe produced no data (exit ${result && result.code})`)
+    const reason = stdout.length >= 3999
+      ? 'probe output was truncated by shell.exec (4 KB limit)'
+      : stderr || `probe produced no data (exit ${result && result.code})`
+    throw new Error(reason)
   }
 
-  return JSON.parse(stdout.slice(marker + SENTINEL.length).trim().split('\n')[0])
+  const payload = JSON.parse(stdout.slice(marker + SENTINEL.length).trim().split('\n')[0])
+
+  for (const router of payload.routers || []) {
+    router.checkedAt = payload.fetchedAt || new Date().toISOString()
+  }
+
+  return payload
+}
+
+async function fetchRouter(routerId) {
+  const summaryPayload = await runProbe({ router: routerId, routerPart: 'summary' })
+  const router = (summaryPayload.routers || [])[0]
+
+  if (!router) {
+    throw new Error(`no local data for ${routerId}`)
+  }
+
+  const routeCount = Number(router.usage && router.usage.routeCount) || 0
+  const offsets = routeCount > 0
+    ? Array.from({ length: Math.ceil(routeCount / ROUTE_PAGE_SIZE) }, (_, index) => index * ROUTE_PAGE_SIZE)
+    : [0]
+  const pages = await Promise.all(offsets.map(routeOffset =>
+    runProbe({ router: routerId, routerPart: 'routes', routeOffset, routeLimit: ROUTE_PAGE_SIZE })
+  ))
+  const routes = []
+  let statusCounts = []
+  let notes = router.notes || []
+
+  for (const pagePayload of pages) {
+    const page = (pagePayload.routers || [])[0]
+
+    if (!page || page.id !== routerId) {
+      throw new Error(`local route details missing for ${routerId}`)
+    }
+
+    routes.push(...((page.usage && page.usage.byRoute) || []))
+    if (page.routeOffset === 0) {
+      if (page.source && Array.isArray(page.source.tables)) {
+        router.source = { ...(router.source || {}), tables: page.source.tables }
+      }
+      if (Array.isArray(page.connections)) {
+        router.connections = page.connections
+      }
+      if (Array.isArray(page.observedAliases)) {
+        router.observedAliases = page.observedAliases
+      }
+    }
+    if (!statusCounts.length) {
+      statusCounts = (page.usage && page.usage.statusCounts) || []
+    }
+    if ((page.notes || []).length) {
+      notes = page.notes
+    }
+  }
+
+  if (routes.length !== routeCount) {
+    throw new Error(`incomplete local route details for ${routerId} (${routes.length}/${routeCount})`)
+  }
+
+  router.usage = { ...(router.usage || {}), byRoute: routes, statusCounts }
+  router.notes = notes
+
+  return { ...summaryPayload, providers: [], routers: [router] }
+}
+
+async function fetchQuotas(filters) {
+  if (filters && filters.router) {
+    return fetchRouter(filters.router)
+  }
+
+  if (filters && (filters.provider || filters.account)) {
+    return runProbe(filters)
+  }
+
+  const started = Date.now()
+  const [providerPayloads, routerPayloads] = await Promise.all([
+    Promise.all(PROVIDER_IDS.map(provider => runProbe({ provider }))),
+    Promise.all(ROUTER_IDS.map(router => fetchRouter(router)))
+  ])
+
+  return {
+    fetchedAt: new Date().toISOString(),
+    elapsedMs: Date.now() - started,
+    providers: providerPayloads.flatMap(payload => payload.providers || []),
+    routers: routerPayloads.flatMap(payload => payload.routers || [])
+  }
 }
 
 function mergeProvider(previous, fresh) {
@@ -95,6 +199,18 @@ function mergeProvider(previous, fresh) {
   return {
     ...previous,
     providers: previous.providers.map(provider => (provider.id === fresh.id ? fresh : provider))
+  }
+}
+
+function mergeRouter(previous, fresh) {
+  const routers = (previous && previous.routers) || []
+  const existing = routers.some(router => router.id === fresh.id)
+
+  return {
+    ...(previous || {}),
+    routers: existing
+      ? routers.map(router => (router.id === fresh.id ? fresh : router))
+      : [...routers, fresh]
   }
 }
 
@@ -262,9 +378,495 @@ function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRe
   })
 }
 
+function formatRouterCount(value) {
+  if (value === null || value === undefined || value === '') {
+    return '—'
+  }
+
+  const number = Number(value)
+
+  if (!Number.isFinite(number)) {
+    return '—'
+  }
+
+  return new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(number)
+}
+
+function formatLocalCost(value) {
+  const number = Number(value)
+
+  return Number.isFinite(number) && number > 0 ? `$${number.toFixed(2)}` : null
+}
+
+function formatRouterTimestamp(value) {
+  if (!value) {
+    return null
+  }
+
+  const date = new Date(value)
+
+  return Number.isFinite(date.getTime())
+    ? date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+    : String(value)
+}
+
+function routerModelLabel(provider, model) {
+  const name = String(model || 'unknown')
+  const source = String(provider || '').trim()
+
+  if (!source || name === source || name.startsWith(`${source}/`)) {
+    return name
+  }
+
+  return `${source} / ${name}`
+}
+
+function routerDefaultSummary(router) {
+  const usage = router.usage || {}
+  const cachedQuotas = router.cachedQuotas || []
+
+  if (router.status === 'unavailable') {
+    return router.summary || 'local database unavailable'
+  }
+
+  const parts = []
+
+  if (usage.available) {
+    parts.push(`${formatRouterCount(usage.requests)} local requests`)
+    const input = Number(usage.inputTokens) || 0
+    const output = Number(usage.outputTokens) || 0
+    const cost = formatLocalCost(usage.estimatedCost)
+
+    if (input || output) {
+      parts.push(`${formatRouterCount(input)} in · ${formatRouterCount(output)} out`)
+    }
+
+    if (cost) {
+      parts.push(`local ledger ${cost}`)
+    }
+  } else {
+    parts.push('configured locally · no local usage rows')
+  }
+
+  const lastActivity = formatRouterTimestamp(usage.lastSeen)
+
+  if (lastActivity) {
+    parts.push(`last activity ${lastActivity}`)
+  }
+
+  if (cachedQuotas.length) {
+    parts.push(`${cachedQuotas.length} cached quota windows`)
+    parts.push('cached only · not refreshed')
+  } else {
+    parts.push('upstream quota not queried')
+  }
+
+  return parts.join(' · ')
+}
+
+function RouterAliasCard({ alias }) {
+  const models = alias.models || []
+  const observed = Number(alias.observedRequests)
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-1.5 rounded-md border border-(--ui-stroke-secondary) p-2',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-1.5',
+        children: [
+          jsx('div', { className: 'min-w-0 flex-1 break-words text-xs font-medium', children: alias.name }),
+          jsx(Badge, { variant: 'muted', size: 'xs', children: alias.strategy || 'unknown' }),
+          Number.isFinite(observed) ? jsx(Badge, { variant: 'outline', size: 'xs', children: `${formatRouterCount(observed)} seen` }) : null
+        ]
+      }),
+      jsx('div', { className: 'text-[0.6rem] leading-relaxed text-(--ui-text-tertiary)', children: alias.explanation }),
+      models.length
+        ? jsxs('div', {
+            className: 'flex flex-col gap-1',
+            children: [
+              jsx('div', { className: 'text-[0.65rem] font-medium text-(--ui-text-secondary)', children: 'Stored model order' }),
+              ...models.map((model, index) =>
+                jsxs(
+                  'div',
+                  {
+                    className: 'flex items-baseline justify-between gap-2 text-[0.65rem]',
+                    children: [
+                      jsx('span', {
+                        className: 'min-w-0 break-words text-(--ui-text-tertiary)',
+                        children: routerModelLabel(model.provider, model.model)
+                      }),
+                      model.weight !== null && model.weight !== undefined
+                        ? jsx('span', { className: 'shrink-0 text-(--ui-text-quaternary)', children: `weight ${model.weight}` })
+                        : null
+                    ]
+                  },
+                  `${alias.name}|${index}`
+                )
+              )
+            ]
+          })
+        : jsx('div', { className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'No model list in local metadata.' })
+    ]
+  })
+}
+
+function RouterUsageVisual({ router }) {
+  const usage = router.usage || {}
+  const input = Number(usage.inputTokens) || 0
+  const output = Number(usage.outputTokens) || 0
+  const metrics = [
+    { label: 'Requests', value: formatRouterCount(usage.requests) },
+    { label: 'Input tokens', value: formatRouterCount(input) },
+    { label: 'Output tokens', value: formatRouterCount(output) },
+    ...(formatLocalCost(usage.estimatedCost)
+      ? [{ label: 'Local cost', value: formatLocalCost(usage.estimatedCost) }]
+      : [])
+  ]
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2',
+    children: [
+      jsxs('div', {
+        className: 'grid grid-cols-2 gap-1.5',
+        children: metrics.map(metric =>
+          jsxs('div', {
+            className: `flex min-w-0 flex-col gap-0.5 rounded border border-(--ui-stroke-secondary) px-1.5 py-1 ${metrics.length === 3 && metric.label === 'Output tokens' ? 'col-span-2' : ''}`,
+            children: [
+              jsx('div', { className: 'truncate text-base font-semibold tabular-nums text-(--ui-text-primary)', children: metric.value }),
+              jsx('div', { className: 'truncate text-(--ui-text-quaternary)', style: { fontSize: '0.6rem' }, children: metric.label })
+            ]
+          }, metric.label)
+        )
+      })
+    ]
+  })
+}
+
+function RouterCallsDetails({ router }) {
+  const usage = router.usage || {}
+  const totalRequests = Math.max(0, Number(usage.requests) || 0)
+  const routes = [...(usage.byRoute || [])].sort((left, right) => Number(right.requests) - Number(left.requests))
+  const topRoutes = routes.slice(0, 4)
+  const topRequests = topRoutes.reduce((total, route) => total + (Number(route.requests) || 0), 0)
+  const otherRequests = Math.max(0, totalRequests - topRequests)
+  const chartRoutes = otherRequests > 0
+    ? [...topRoutes, { other: true, requests: otherRequests }]
+    : topRoutes
+
+  return jsx('details', {
+    className: 'text-[0.58rem]',
+    children: [
+      jsx('summary', {
+        className: 'cursor-pointer select-none text-[0.58rem] text-(--ui-text-secondary)',
+        children: 'Calls per model'
+      }),
+      totalRequests > 0 && chartRoutes.length
+        ? jsxs('div', {
+            className: 'mt-2 flex flex-col gap-1.5',
+            children: [
+              jsx('div', { className: 'text-[0.55rem] text-(--ui-text-quaternary)', children: 'Share of local requests' }),
+              ...chartRoutes.map((route, index) => {
+                const requestCount = Math.max(0, Number(route.requests) || 0)
+                const sharePct = Math.max(0, Math.min(100, requestCount / totalRequests * 100))
+                const label = route.other ? 'Other' : routerModelLabel(route.provider, route.model)
+
+                return jsxs('div', {
+                  className: 'flex flex-col gap-0.5',
+                  children: [
+                    jsxs('div', {
+                      className: 'flex items-start justify-between gap-2 text-[0.58rem]',
+                      children: [
+                        jsx('span', { className: 'min-w-0 flex-1 break-words text-(--ui-text-tertiary)', title: label, children: label }),
+                        jsx('span', {
+                          className: 'shrink-0 tabular-nums text-(--ui-text-secondary)',
+                          children: `${formatRouterCount(requestCount)} · ${formatPct(sharePct)}%`
+                        })
+                      ]
+                    }),
+                    jsx('div', {
+                      className: 'h-1.5 w-full overflow-hidden rounded-full bg-(--ui-stroke-secondary)',
+                      role: 'meter',
+                      'aria-label': `${label} share of local requests`,
+                      'aria-valuemin': 0,
+                      'aria-valuemax': 100,
+                      'aria-valuenow': sharePct,
+                      title: `${formatRouterCount(requestCount)} of ${formatRouterCount(totalRequests)} local requests`,
+                      children: jsx('div', {
+                        className: 'route-meter-fill h-full rounded-full bg-(--ui-accent)',
+                        style: { width: `${sharePct}%`, opacity: Math.max(0.45, 1 - index * 0.12) }
+                      })
+                    })
+                  ]
+                }, `${router.id}|route-share|${index}`)
+              })
+            ]
+          })
+        : jsx('div', { className: 'pt-2 text-[0.55rem] text-(--ui-text-quaternary)', children: 'No local request-share data' }),
+      jsx('details', {
+        className: 'mt-3 text-[0.55rem]',
+        children: [
+          jsx('summary', { className: 'cursor-pointer select-none text-(--ui-text-quaternary)', children: 'More router details' }),
+          jsx(RouterDetails, { router })
+        ]
+      })
+    ]
+  })
+}
+
+function quotaPctOrNull(value) {
+  if (value === null || value === undefined || value === '') {
+    return null
+  }
+
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
+// The probe reports cached snapshots as remaining%; every other quota readout
+// in this pane is used%. Convert at render so both read the same direction;
+// the complement swaps the aggregates (the most-used connection has the
+// LOWEST remaining).
+function usedPctFromRemaining(value) {
+  const remaining = quotaPctOrNull(value)
+  return remaining === null ? null : Math.max(0, Math.min(100, 100 - remaining))
+}
+
+function RouterQuotaMeter({ snapshot }) {
+  const usedHigh = usedPctFromRemaining(snapshot.lowestRemainingPct)
+  const usedLow = usedPctFromRemaining(snapshot.highestRemainingPct)
+
+  if (usedHigh === null) {
+    return null
+  }
+
+  const pct = usedHigh
+  const shown = usedLow !== null && usedLow !== usedHigh
+    ? `${formatPct(usedLow)}–${formatPct(usedHigh)}%`
+    : `${formatPct(usedHigh)}%`
+  const label = `${snapshot.provider} · ${snapshot.window}`
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-1',
+    children: [
+      jsxs('div', {
+        className: 'flex items-baseline justify-between gap-2 text-[0.58rem]',
+        children: [
+          jsx('span', { className: 'min-w-0 truncate text-(--ui-text-tertiary)', children: label }),
+          jsx('span', { className: 'shrink-0 tabular-nums text-(--ui-text-secondary)', children: shown })
+        ]
+      }),
+      jsx('div', {
+        className: 'h-1.5 w-full overflow-hidden rounded-full bg-(--ui-stroke-secondary)',
+        role: 'meter',
+        'aria-label': `${label} quota used`,
+        'aria-valuemin': 0,
+        'aria-valuemax': 100,
+        'aria-valuenow': pct,
+        title: `highest used across ${formatRouterCount(snapshot.connections)} connections`,
+        children: jsx('div', {
+          className: 'quota-meter-fill h-full rounded-full bg-(--ui-accent)',
+          style: { width: `${pct}%` }
+        })
+      })
+    ]
+  })
+}
+
+function RouterQuotaCard({ snapshot }) {
+  const usedHigh = usedPctFromRemaining(snapshot.lowestRemainingPct)
+  const usedLow = usedPctFromRemaining(snapshot.highestRemainingPct)
+  const used = usedLow !== null && usedHigh !== null
+    ? `${formatPct(usedLow)}–${formatPct(usedHigh)}% used`
+    : 'used percentage unavailable'
+  const observed = [
+    formatRouterTimestamp(snapshot.oldestSnapshotAt),
+    formatRouterTimestamp(snapshot.newestSnapshotAt)
+  ].filter(Boolean)
+  const observedLabel = observed.length === 2 && observed[0] !== observed[1]
+    ? `${observed[0]} – ${observed[1]}`
+    : observed[0] || 'unknown'
+  const resetLabel = snapshot.resetAt
+    ? `reset ${formatRouterTimestamp(snapshot.resetAt)}`
+    : snapshot.resetsVary
+      ? 'reset times vary or are unavailable'
+      : 'reset time unavailable'
+  const connectionCount = Number(snapshot.connections)
+  const connectionNoun = connectionCount === 1 ? 'connection' : 'connections'
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-0.5 rounded border border-(--ui-stroke-secondary) px-2 py-1.5 text-[0.65rem]',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-tertiary)', children: `${snapshot.provider} · ${snapshot.window}` }),
+      jsx('div', {
+        className: 'text-(--ui-text-quaternary)',
+        children: `${used} across ${formatRouterCount(snapshot.connections)} ${connectionNoun} · ${formatRouterTimestamp(snapshot.newestSnapshotAt) || 'snapshot time unknown'}`
+      }),
+      jsx('div', { className: 'text-(--ui-text-quaternary)', children: `${resetLabel} · ${formatRouterCount(snapshot.exhaustedConnections)} exhausted` }),
+      observedLabel !== (formatRouterTimestamp(snapshot.newestSnapshotAt) || 'unknown')
+        ? jsx('div', { className: 'text-(--ui-text-quaternary)', children: `snapshot range ${observedLabel}` })
+        : null
+    ]
+  })
+}
+
+function RouterDetails({ router }) {
+  const source = router.source || {}
+  const usage = router.usage || {}
+  const aliases = router.aliases || []
+  const cachedQuotas = router.cachedQuotas || []
+  const routes = usage.byRoute || []
+  const connections = router.connections || []
+  const statuses = usage.statusCounts || []
+  const tables = (source.tables || []).filter(table => table.present)
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-3 pt-2',
+    children: [
+      jsx('div', {
+        className: 'text-[0.58rem] leading-relaxed text-(--ui-text-tertiary)',
+        children: 'This section is local router data only. It does not fetch upstream subscription quota, test a provider, send a model request, or change router state.'
+      }),
+      (router.notes || []).map((note, index) =>
+        jsx('div', { className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: note }, `router-note-${router.id}-${index}`)
+      ),
+      jsxs('div', {
+        className: 'flex flex-col gap-1',
+        children: [
+          jsx('div', { className: 'text-[0.65rem] font-medium text-(--ui-text-secondary)', children: 'Local data source' }),
+          jsx('div', { className: 'break-all text-[0.65rem] text-(--ui-text-tertiary)', children: `${source.path || 'unknown'} · ${source.readOnly ? 'read-only SQLite' : 'read mode not confirmed'}` }),
+          jsx('div', {
+            className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+            children: tables.length ? `tables: ${tables.map(table => `${table.name} (${formatRouterCount(table.rows)} rows)`).join(' · ')}` : 'expected local tables were not found'
+          })
+        ]
+      }),
+      cachedQuotas.length
+        ? jsxs('div', {
+            className: 'flex flex-col gap-1.5',
+            children: [
+              jsx('div', { className: 'text-[0.65rem] font-medium text-(--ui-text-secondary)', children: 'Cached upstream quota snapshots' }),
+              jsx('div', {
+                className: 'text-[0.65rem] leading-relaxed text-(--ui-text-quaternary)',
+                children: 'Used percentages are aggregated across connections. These cached values are read-only and are not refreshed by this dashboard.'
+              }),
+              ...cachedQuotas.map((snapshot, index) => jsx(RouterQuotaCard, { snapshot }, `${router.id}|cached-quota|${index}`))
+            ]
+          })
+        : null,
+      aliases.length
+        ? jsxs('div', {
+            className: 'flex flex-col gap-2',
+            children: [
+              jsx('div', { className: 'text-[0.65rem] font-medium text-(--ui-text-secondary)', children: 'Route aliases and explanations' }),
+              ...aliases.map(alias => jsx(RouterAliasCard, { alias }, `${router.id}|alias|${alias.name}`))
+            ]
+          })
+        : jsx('div', { className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'No configured route aliases were found in local metadata.' }),
+      routes.length
+        ? jsxs('div', {
+            className: 'flex flex-col gap-1.5',
+            children: [
+              jsx('div', { className: 'text-[0.65rem] font-medium text-(--ui-text-secondary)', children: 'Observed local models' }),
+              ...routes.map((route, index) =>
+                jsxs(
+                  'div',
+                  {
+                    className: 'flex flex-col gap-0.5 rounded border border-(--ui-stroke-secondary) px-2 py-1.5 text-[0.65rem]',
+                    children: [
+                      jsx('div', { className: 'break-words text-(--ui-text-tertiary)', children: routerModelLabel(route.provider, route.model) }),
+                      jsx('div', {
+                        className: 'text-(--ui-text-quaternary)',
+                        children: `${formatRouterCount(route.requests)} local requests · ${formatRouterCount(route.inputTokens)} in · ${formatRouterCount(route.outputTokens)} out · ${route.strategy || 'direct'}`
+                      }),
+                      route.estimatedCost ? jsx('div', { className: 'text-(--ui-text-quaternary)', children: `local ledger ${formatLocalCost(route.estimatedCost)}` }) : null
+                    ]
+                  },
+                  `${router.id}|route|${index}`
+                )
+              )
+            ]
+          })
+        : null,
+      connections.length
+        ? jsxs('div', {
+            className: 'flex flex-col gap-1',
+            children: [
+              jsx('div', { className: 'text-[0.65rem] font-medium text-(--ui-text-secondary)', children: 'Configured connections (metadata only)' }),
+              ...connections.map((connection, index) =>
+                jsx(
+                  'div',
+                  {
+                    className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+                    children: `${connection.provider || 'unknown'} · ${formatRouterCount(connection.active)} active / ${formatRouterCount(connection.connections)} total`
+                  },
+                  `${router.id}|connection|${index}`
+                )
+              )
+            ]
+          })
+        : null,
+      statuses.length
+        ? jsxs('div', {
+            className: 'flex flex-col gap-1',
+            children: [
+              jsx('div', { className: 'text-[0.65rem] font-medium text-(--ui-text-secondary)', children: 'Local record statuses' }),
+              jsx('div', { className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: statuses.map(item => `${item.status}: ${formatRouterCount(item.requests)}`).join(' · ') })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function LocalRouterSection({ router, busy, onRefresh }) {
+  const status = router.status === 'available' ? 'local data' : router.status === 'unavailable' ? 'unavailable' : router.status || 'unknown'
+  const available = router.status === 'available'
+  const usageAvailable = Boolean(router.usage && router.usage.available)
+  const cachedQuotas = router.cachedQuotas || []
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) p-2',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-1.5',
+        children: [
+          jsx('div', { className: 'min-w-0 flex-1 truncate text-xs font-medium', children: router.name }),
+          jsx(Badge, { variant: router.status === 'unavailable' ? 'muted' : 'outline', size: 'xs', children: status }),
+          jsx(RefreshButton, { busy, onRefresh, label: `Refresh ${router.name} local data` })
+        ]
+      }),
+      usageAvailable
+        ? jsx(RouterUsageVisual, { router })
+        : jsx('div', {
+            className: 'text-[0.6rem] leading-relaxed text-(--ui-text-tertiary)',
+            children: routerDefaultSummary(router)
+          }),
+      cachedQuotas.length
+        ? jsxs('div', {
+            className: 'flex flex-col gap-1.5',
+            children: [
+              jsx('div', { className: 'text-[0.58rem] font-medium text-(--ui-text-secondary)', children: 'Cached quota · used' }),
+              ...cachedQuotas.map((snapshot, index) => jsx(RouterQuotaMeter, { snapshot }, `${router.id}|quota-meter|${index}`))
+            ]
+          })
+        : available
+          ? jsxs('div', {
+              className: 'flex items-center gap-1.5 text-[0.58rem] text-(--ui-text-quaternary)',
+              children: [
+                jsx('span', { className: 'inline-flex size-5 items-center justify-center rounded-full border border-dashed border-(--ui-stroke-secondary)', children: '—' }),
+                jsx('span', { children: 'No cached upstream quota' })
+              ]
+            })
+          : null,
+      usageAvailable ? jsx(RouterCallsDetails, { router }) : null
+    ]
+  })
+}
+
 function QuotaPane() {
   const [busyProviders, setBusyProviders] = useState({})
   const [busyAccounts, setBusyAccounts] = useState({})
+  const [busyRouters, setBusyRouters] = useState({})
   // Per-scope refresh generations: a slow in-flight response must never
   // clobber a newer refresh's result (last click wins).
   const refreshSeq = useRef({})
@@ -381,7 +983,39 @@ function QuotaPane() {
       })
   }
 
+  const refreshRouter = routerId => {
+    haptic('tap')
+    const scope = `router:${routerId}`
+    const token = beginRefresh(scope)
+    setBusyRouters(previous => ({ ...previous, [routerId]: true }))
+    fetchQuotas({ router: routerId })
+      .then(payload => {
+        if (!isCurrent(scope, token)) {
+          return
+        }
+
+        const fresh = (payload.routers || [])[0]
+
+        if (!fresh) {
+          throw new Error(`no local data for ${routerId}`)
+        }
+
+        queryClient.setQueryData(QUERY_KEY, previous => mergeRouter(previous, fresh))
+      })
+      .catch(err => {
+        if (isCurrent(scope, token)) {
+          failure(err)
+        }
+      })
+      .finally(() => {
+        if (isCurrent(scope, token)) {
+          setBusyRouters(previous => ({ ...previous, [routerId]: false }))
+        }
+      })
+  }
+
   const fetchedAt = query.data && query.data.fetchedAt ? new Date(query.data.fetchedAt) : null
+  const routers = (query.data && query.data.routers) || []
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-3 overflow-y-auto p-3 text-sm',
@@ -453,7 +1087,23 @@ function QuotaPane() {
                     },
                     provider.id
                   )
-                )
+                ),
+                ...(routers.length
+                  ? [
+                      jsx('div', { className: 'pt-1 text-xs font-medium text-(--ui-text-secondary)', children: 'Local routers' }),
+                      ...routers.map(router =>
+                        jsx(
+                          LocalRouterSection,
+                          {
+                            router,
+                            busy: Boolean(busyRouters[router.id]),
+                            onRefresh: () => refreshRouter(router.id)
+                          },
+                          router.id
+                        )
+                      )
+                    ]
+                  : [])
               ]
             })
     ]
@@ -554,7 +1204,6 @@ function providerForModel(slug) {
   if (/luna|sol|terra|codex|gpt-5|(^|\/)o[34]/.test(text)) {
     return 'openai-codex'
   }
-
   return null
 }
 

@@ -559,29 +559,37 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
             row = probe.probe_claude(self.claude_account())
         self.assertIn("HTTP 429", row["error"])
 
-    def test_antigravity_pools_models_by_family(self):
-        models = {"models": {
-            "claude-opus-4-6-thinking": {"displayName": "Claude Opus 4.6 (Thinking)",
-                                         "quotaInfo": {"remainingFraction": 0.6, "resetTime": "2026-10-03T16:16:20Z"}},
-            "claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6 (Thinking)",
-                                  "quotaInfo": {"remainingFraction": 0.9}},
-            "gemini-3.1-pro-high": {"displayName": "Gemini 3.1 Pro (High)", "quotaInfo": {"remainingFraction": 1}},
-            "gemini-3-flash": {"displayName": "Gemini 3 Flash", "quotaInfo": {"remainingFraction": 0.75}},
-            "tab_flash_lite_preview": {"quotaInfo": {"remainingFraction": 0}},
-        }}
+    def test_antigravity_meters_each_group_5h_and_weekly(self):
+        summary = {"groups": [
+            {"displayName": "Gemini Models", "description": "Models within this group: Gemini Flash, Gemini Pro",
+             "buckets": [
+                 {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.9,
+                  "resetTime": "2026-10-10T11:25:13Z"},
+                 {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.5,
+                  "resetTime": "2026-10-03T16:25:13Z"}]},
+            {"displayName": "Claude and GPT models", "description": "Models within this group: Claude Opus, GPT-OSS",
+             "buckets": [
+                 {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.75},
+                 {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.2}]},
+        ]}
         load = {"paidTier": {"name": "Google AI Pro"}, "cloudaicompanionProject": "p-1"}
+        seen = []
 
         def post(url, headers=None, json=None, timeout=None):
-            return self.Response(200, load if url.endswith(":loadCodeAssist") else models)
+            seen.append(url.rsplit(":", 1)[-1])
+            return self.Response(200, load if url.endswith(":loadCodeAssist") else summary)
 
         account = {"label": "agy", "token": "agy-token", "base": "", "fp": "cafe00000000",
                    "expires": "2099-01-01T00:00:00+00:00"}
         with patch.object(probe.httpx, "post", post):
             row = probe.probe_antigravity(account)
+        self.assertEqual(seen, ["loadCodeAssist", "retrieveUserQuotaSummary"])
         self.assertIsNone(row["error"])
         self.assertEqual(row["plan"], "Google AI Pro")
-        self.assertEqual([(w["k"], w["pct"]) for w in row["windows"]],
-                         [("Claude models", 40.0), ("Gemini Pro", 0.0), ("Gemini Flash", 25.0)])
+        self.assertEqual([(w["k"], w["group"], w["pct"]) for w in row["windows"]], [
+            ("Gemini 5h", "Gemini", 50.0), ("Gemini weekly", "Gemini", 10.0),
+            ("Claude/GPT 5h", "Claude/GPT", 80.0), ("Claude/GPT weekly", "Claude/GPT", 25.0)])
+        self.assertEqual(row["windows"][0]["note"], "Gemini Flash, Gemini Pro")
         self.assertNotIn("agy-token", json.dumps(row))
 
     def test_antigravity_expired_token_is_never_refreshed(self):

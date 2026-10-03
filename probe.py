@@ -29,6 +29,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -1275,29 +1276,10 @@ def antigravity_accounts() -> list:
     return accounts
 
 
-# fetchAvailableModels lists ~25 model ids that share a few quota pools. Group
-# them by family and meter the most-used model of each pool, so the pane shows
-# a handful of bars instead of every id. Ids without a display name (tab /
-# internal chat models) are not user-selectable and are skipped.
-ANTIGRAVITY_FAMILIES = (
-    ("claude", "Claude models"),
-    ("gpt-oss", "GPT-OSS"),
-    ("gemini-pro", "Gemini Pro"),
-    ("gemini", "Gemini Flash"),
-)
-
-
-def antigravity_family(model_id: str, display: str) -> str | None:
-    text = f"{model_id} {display}".lower()
-    if "claude" in text:
-        return "claude"
-    if "gpt-oss" in text:
-        return "gpt-oss"
-    if "gemini" in text and " pro" in f" {display.lower()}":
-        return "gemini-pro"
-    if "gemini" in text:
-        return "gemini"
-    return None
+def antigravity_group_label(name: str) -> str:
+    """"Gemini Models" -> "Gemini", "Claude and GPT models" -> "Claude/GPT"."""
+    text = re.sub(r"\s+models?$", "", str(name or "").strip(), flags=re.I)
+    return re.sub(r"\s+and\s+", "/", text) or "Models"
 
 
 def probe_antigravity(account: dict) -> dict:
@@ -1340,35 +1322,36 @@ def _probe_antigravity(account: dict, live) -> dict:
         tier = info.get("paidTier") or info.get("currentTier") or {}
         row["plan"] = safe_text(tier.get("name"), 40) or None
         project = info.get("cloudaicompanionProject")
-        models = httpx.post(base + ":fetchAvailableModels", headers=headers,
-                            json={"project": project} if project else {}, timeout=TIMEOUT)
-        if models.status_code == 429:
+        # retrieveUserQuotaSummary is what agy's own quota view reads: model
+        # groups (Gemini; Claude + GPT-OSS), each with a 5h and a weekly bucket.
+        summary = httpx.post(base + ":retrieveUserQuotaSummary", headers=headers,
+                             json={"project": project} if project else {}, timeout=TIMEOUT)
+        if summary.status_code == 429:
             row["error"] = "HTTP 429 - quota endpoint rate-limited; retry in a minute"
             return row
-        if models.status_code != 200:
-            row["error"] = f"fetchAvailableModels HTTP {models.status_code}"
+        if summary.status_code != 200:
+            row["error"] = f"retrieveUserQuotaSummary HTTP {summary.status_code}"
             return row
-        pools: dict = {}
-        for model_id, model in ((models.json() or {}).get("models") or {}).items():
-            if not isinstance(model, dict) or not model.get("displayName"):
+        order = {"5h": 0, "weekly": 1}
+        for group in (summary.json() or {}).get("groups") or []:
+            if not isinstance(group, dict):
                 continue
-            quota = model.get("quotaInfo") or {}
-            remaining = quota.get("remainingFraction")
-            family = antigravity_family(str(model_id), str(model["displayName"]))
-            if family is None or not isinstance(remaining, (int, float)):
-                continue
-            used = round((1 - float(remaining)) * 100, 1)
-            pool = pools.setdefault(family, {"pct": used, "reset": quota.get("resetTime"), "names": set()})
-            pool["names"].add(str(model["displayName"]).split(" (")[0])
-            if used > pool["pct"]:
-                pool["pct"], pool["reset"] = used, quota.get("resetTime")
-        for family, label in ANTIGRAVITY_FAMILIES:
-            pool = pools.get(family)
-            if pool:
-                row["windows"].append({"k": label, "pct": pool["pct"], "reset": local_iso(pool["reset"]),
-                                       "note": ", ".join(sorted(pool["names"]))[:60]})
+            label = antigravity_group_label(group.get("displayName"))
+            buckets = [b for b in group.get("buckets") or [] if isinstance(b, dict)]
+            for bucket in sorted(buckets, key=lambda b: order.get(str(b.get("window")), 9)):
+                remaining = bucket.get("remainingFraction")
+                window = str(bucket.get("window") or "").strip()
+                if not isinstance(remaining, (int, float)) or not window:
+                    continue
+                row["windows"].append({
+                    "k": f"{label} {window}",
+                    "group": label,
+                    "pct": round((1 - float(remaining)) * 100, 1),
+                    "reset": local_iso(bucket.get("resetTime")),
+                    "note": safe_text(re.sub(r"^Models within this group:\s*", "", str(group.get("description") or "")), 60) or None,
+                })
         if not row["windows"]:
-            row["notes"].append("no metered models reported")
+            row["notes"].append("no quota groups reported")
     except Exception as exc:
         row["error"] = f"{type(exc).__name__}: {str(exc)[:80]}"
     return row

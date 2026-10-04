@@ -1471,6 +1471,12 @@ def antigravity_accounts() -> list:
             return token
         return None
 
+    # The companion CLI gives each rotation account a short numeric `id` (host is
+    # 0); it names the row instead of the label, usually a long email address.
+    registry = antigravity_registry()
+    entries = [acc for acc in registry.get("accounts") or [] if isinstance(acc, dict)]
+    host = "#0" if any(isinstance(acc.get("id"), int) for acc in entries) else "default"
+
     override = (os.environ.get("ANTIGRAVITY_CONFIG_DIR") or ENV.get("ANTIGRAVITY_CONFIG_DIR") or "").strip()
     if sys.platform == "darwin" and not override and not os.environ.get("HERMES_QUOTA_NO_KEYCHAIN"):
         try:
@@ -1478,7 +1484,7 @@ def antigravity_accounts() -> list:
                                   "-a", "antigravity", "-w"], capture_output=True, text=True, timeout=10)
             token = parse(out.stdout) if out.returncode == 0 else None
             if token:
-                found.append(("default", token))
+                found.append(("", host, token))
         except Exception:
             pass
 
@@ -1493,27 +1499,29 @@ def antigravity_accounts() -> list:
                 return token
         return None
 
+    # Rotation accounts registered by antigravity-subscription-directsdk: each has
+    # its own HOME and token. The provider records which account served the last
+    # request ("serving"); that one goes first, which is the row the dock meters.
+    serving = ""
     dirs = [os.path.expanduser(override)] if override else [os.path.join(HOME, ".gemini", "antigravity-cli")]
     for directory in dirs:
         token = read_token_dir(directory)
         if token:
-            found.append(("default" if not override else f"agy login ({display_path(directory)})", token))
-    # Rotation accounts registered by antigravity-subscription-directsdk: each has
-    # its own HOME and token. The provider records which account served the last
-    # request ("serving"); that one goes first, which is the row the dock meters.
-    registry, serving = antigravity_registry(), ""
+            found.append(("", host if not override else f"agy login ({display_path(directory)})", token))
     if registry:
         serving = str((registry.get("serving") or {}).get("label") or "")
-        for acc in registry.get("accounts") or []:
-            if not isinstance(acc, dict) or not acc.get("enabled", True) or not acc.get("home_dir"):
+        for acc in entries:
+            if not acc.get("enabled", True) or not acc.get("home_dir"):
                 continue
             token = read_token_dir(os.path.join(os.path.expanduser(acc["home_dir"]), ".gemini", "antigravity-cli"))
             if token:
-                found.append((str(acc.get("label") or acc["home_dir"]), token))
-    found.sort(key=lambda item: 0 if item[0] == (serving or "default") else 1)
+                label = str(acc.get("label") or acc["home_dir"])
+                shown = f"#{acc['id']}" if isinstance(acc.get("id"), int) else label
+                found.append((label, shown, token))
+    found.sort(key=lambda item: 0 if item[0] == serving else 1)
     seen: set = set()
     accounts = []
-    for label, token in found:
+    for _, label, token in found:
         access = str(token["access_token"])
         fp = sha(access)[:12]
         if fp in seen:

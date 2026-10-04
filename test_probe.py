@@ -684,6 +684,11 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
                 json.dump({"serving": {"label": ""}, "accounts": [
                     {"label": "work", "home_dir": os.path.join(root, "acc", "work")}]}, handle)
             self.assertEqual([a["label"] for a in probe.antigravity_accounts()], ["default", "work"])
+            # With the companion's numeric ids the rows are named by id, host is #0.
+            with open(registry, "w") as handle:
+                json.dump({"serving": {"label": "work"}, "accounts": [
+                    {"id": 3, "label": "work", "home_dir": os.path.join(root, "acc", "work")}]}, handle)
+            self.assertEqual([a["label"] for a in probe.antigravity_accounts()], ["#3", "#0"])
 
 
 class FakePool:

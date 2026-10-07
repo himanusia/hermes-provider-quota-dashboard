@@ -689,6 +689,14 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
                 json.dump({"serving": {"label": "work"}, "accounts": [
                     {"id": 3, "label": "work", "home_dir": os.path.join(root, "acc", "work")}]}, handle)
             self.assertEqual([a["label"] for a in probe.antigravity_accounts()], ["#3", "#0"])
+            # The registry stores an empty label when it merely repeats the email,
+            # while the provider records the RESOLVED name (the email) as serving.
+            # The serving row must still be matched, not fall back to host #0.
+            with open(registry, "w") as handle:
+                json.dump({"serving": {"label": "w@example.com"}, "accounts": [
+                    {"id": 1, "label": "", "email": "w@example.com",
+                     "home_dir": os.path.join(root, "acc", "work")}]}, handle)
+            self.assertEqual([a["label"] for a in probe.antigravity_accounts()], ["#1", "#0"])
 
 
 class FakePool:

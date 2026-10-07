@@ -1515,7 +1515,11 @@ def antigravity_accounts() -> list:
                 continue
             token = read_token_dir(os.path.join(os.path.expanduser(acc["home_dir"]), ".gemini", "antigravity-cli"))
             if token:
-                label = str(acc.get("label") or acc["home_dir"])
+                # Same runtime name the provider records as "serving": its stored
+                # label is empty when it merely repeats the email, so resolve
+                # label -> email -> home folder exactly like the plugin does.
+                label = (str(acc.get("label") or "").strip() or str(acc.get("email") or "").strip()
+                         or os.path.basename(os.path.normpath(os.path.expanduser(str(acc["home_dir"])))))
                 shown = f"#{acc['id']}" if isinstance(acc.get("id"), int) else label
                 found.append((label, shown, token))
     found.sort(key=lambda item: 0 if item[0] == serving else 1)

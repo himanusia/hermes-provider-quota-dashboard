@@ -1484,7 +1484,7 @@ def antigravity_accounts() -> list:
                                   "-a", "antigravity", "-w"], capture_output=True, text=True, timeout=10)
             token = parse(out.stdout) if out.returncode == 0 else None
             if token:
-                found.append(("", host, token))
+                found.append(("", host, token, ""))
         except Exception:
             pass
 
@@ -1507,7 +1507,7 @@ def antigravity_accounts() -> list:
     for directory in dirs:
         token = read_token_dir(directory)
         if token:
-            found.append(("", host if not override else f"agy login ({display_path(directory)})", token))
+            found.append(("", host if not override else f"agy login ({display_path(directory)})", token, ""))
     if registry:
         serving = str((registry.get("serving") or {}).get("label") or "")
         for acc in entries:
@@ -1521,18 +1521,23 @@ def antigravity_accounts() -> list:
                 label = (str(acc.get("label") or "").strip() or str(acc.get("email") or "").strip()
                          or os.path.basename(os.path.normpath(os.path.expanduser(str(acc["home_dir"])))))
                 shown = f"#{acc['id']}" if isinstance(acc.get("id"), int) else label
-                found.append((label, shown, token))
+                # The provider records agy's verdict per account. An account agy
+                # refuses is not metered: the quota API still answers 200 with
+                # zeros for it, which would read as a healthy, unused account.
+                state = str(acc.get("state") or "")
+                refused = state if state in ("not_eligible", "needs_login") else ("not_eligible" if acc.get("eligible") is False else "")
+                found.append((label, shown, token, refused))
     found.sort(key=lambda item: 0 if item[0] == serving else 1)
     seen: set = set()
     accounts = []
-    for _, label, token in found:
+    for _, label, token, refused in found:
         access = str(token["access_token"])
         fp = sha(access)[:12]
         if fp in seen:
             continue
         seen.add(fp)
         accounts.append({"label": label, "token": access, "base": ANTIGRAVITY_DEFAULT_BASE, "fp": fp,
-                         "expires": token.get("expiry")})
+                         "expires": token.get("expiry"), "refused": refused})
     return accounts
 
 
@@ -1543,6 +1548,9 @@ def antigravity_group_label(name: str) -> str:
 
 
 def probe_antigravity(account: dict) -> dict:
+    if account.get("refused"):
+        # Never served from the snapshot cache: stale numbers would resurrect it.
+        return _probe_antigravity(account, False)
     return with_snapshot("antigravity-subscription", account, lambda live: _probe_antigravity(account, live))
 
 
@@ -1561,6 +1569,11 @@ def _probe_antigravity(account: dict, live) -> dict:
             pass
     row = {"label": account["label"], "sub": " - ".join(bits), "plan": None,
            "windows": [], "notes": [], "error": None}
+    refused = account.get("refused")
+    if refused:
+        row["error"] = ("agy login needs sign-in again" if refused == "needs_login"
+                        else "not eligible for Antigravity; verify the Google account in a browser")
+        return row
     if expired:
         # Refreshing would rewrite agy's keychain item: not ours to do.
         row["error"] = "token expired; run any agy / Hermes Antigravity turn to refresh it"

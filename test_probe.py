@@ -722,11 +722,14 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
         self.assertEqual(row["windows"], [])
         self.assertIn("not eligible", row["error"])
 
-    def test_plugin_hides_providers_without_a_usable_account_and_can_collapse(self):
+    def test_plugin_collapses_sections_without_quota_and_can_reorder(self):
         source = (Path(__file__).parent / "plugin.js").read_text(encoding="utf-8")
-        self.assertIn("function usableProviders(", source)
-        self.assertIn("usableProviders(((query.data", source)
+        self.assertIn("const hasQuota = ", source)
         self.assertIn("function setCollapsed(", source)
+        self.assertIn("function moveSection(", source)
+        # A section with no quota starts collapsed instead of being removed.
+        self.assertIn(": !usable", source)
+        self.assertNotIn("usableProviders(", source)
 
 
 class FakePool:

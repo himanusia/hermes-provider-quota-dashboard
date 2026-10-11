@@ -67,7 +67,8 @@ const DEFAULT_PREFS = {
   chip: true,
   notes: true,
   plan: true,
-  collapsed: {}
+  collapsed: {},
+  order: []
 }
 const PREFS_KEY = 'displayPrefs'
 let prefsStorage = null
@@ -87,13 +88,17 @@ function normalizePrefs(raw) {
 
   const collapsed = {}
 
+  // An explicit choice either way; a missing id follows the default (collapsed
+  // when the section has no quota to show).
   for (const [id, on] of Object.entries(value.collapsed && typeof value.collapsed === 'object' ? value.collapsed : {})) {
-    if (on === true) {
-      collapsed[id] = true
+    if (typeof on === 'boolean') {
+      collapsed[id] = on
     }
   }
 
-  return { sections, chip: flag('chip'), notes: flag('notes'), plan: flag('plan'), collapsed }
+  const order = Array.isArray(value.order) ? [...new Set(value.order.filter(id => typeof id === 'string'))] : []
+
+  return { sections, chip: flag('chip'), notes: flag('notes'), plan: flag('plan'), collapsed, order }
 }
 
 function setPrefs(update) {
@@ -109,6 +114,36 @@ function setPrefs(update) {
 // Collapsing a section is purely visual: persist it without re-probing.
 function setCollapsed(id, on) {
   const next = normalizePrefs({ ...$prefs.get(), collapsed: { ...$prefs.get().collapsed, [id]: on } })
+  $prefs.set(next)
+  if (prefsStorage) {
+    prefsStorage.set(PREFS_KEY, next)
+  }
+}
+
+// Section order is the user's: ids they never moved keep the probe's order
+// after the ones they did.
+function orderedProviders(providers, order) {
+  const rank = id => {
+    const index = order.indexOf(id)
+
+    return index === -1 ? order.length : index
+  }
+
+  return [...providers].sort((a, b) => rank(a.id) - rank(b.id))
+}
+
+function moveSection(ids, id, delta) {
+  const current = orderedProviders(ids.map(value => ({ id: value })), $prefs.get().order).map(item => item.id)
+  const from = current.indexOf(id)
+  const to = from + delta
+
+  if (from === -1 || to < 0 || to >= current.length) {
+    return
+  }
+
+  current.splice(to, 0, current.splice(from, 1)[0])
+
+  const next = normalizePrefs({ ...$prefs.get(), order: current })
   $prefs.set(next)
   if (prefsStorage) {
     prefsStorage.set(PREFS_KEY, next)
@@ -532,20 +567,15 @@ function ActiveAccountPanel({ providers }) {
   })
 }
 
-// An account with no quota window has nothing to show: no subscription, a
-// rejected key, or an ineligible login. Those are hidden, not listed as errors,
-// and a provider left with no usable account disappears entirely.
+// An account with no quota window (no subscription, a rejected key, an
+// ineligible login) has nothing to meter. Its section stays in the list, but
+// starts collapsed and is kept out of the active-accounts panel.
 const hasQuota = account => (account.windows || []).length > 0
 
-function usableProviders(providers) {
-  return (providers || [])
-    .map(provider => ({ ...provider, accounts: (provider.accounts || []).filter(hasQuota) }))
-    .filter(provider => provider.accounts.length > 0)
-}
-
-function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRefreshAccount }) {
+function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRefreshAccount, canMove, onMove }) {
   const prefs = useValue($prefs)
-  const collapsed = prefs.collapsed[provider.id] === true
+  const usable = (provider.accounts || []).some(hasQuota)
+  const collapsed = typeof prefs.collapsed[provider.id] === 'boolean' ? prefs.collapsed[provider.id] : !usable
   // Credentials that resolve to the same account share one quota — collapse
   // them into a single card; the card lists the credentials that share it.
   const groups = []
@@ -567,6 +597,23 @@ function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRe
     group.creds.push({ label: account.label, fp: account.fp, error: account.error })
   }
 
+  const liveGroups = groups.filter(group => hasQuota(group.account))
+  const deadGroups = groups.filter(group => !hasQuota(group.account))
+  const deadKey = `${provider.id}:none`
+  const deadCollapsed = typeof prefs.collapsed[deadKey] === 'boolean' ? prefs.collapsed[deadKey] : true
+  const renderGroup = group =>
+    jsx(
+      AccountCard,
+      {
+        account: group.account,
+        sharedCreds: group.creds,
+        active: group.active,
+        busy: group.creds.some(cred => Boolean(busyAccounts[`${provider.id}:${cred.fp}`])),
+        onRefresh: () => group.creds.filter(cred => cred.fp).forEach(cred => onRefreshAccount(provider.id, cred.fp, cred.label))
+      },
+      `${provider.id}|${group.key}`
+    )
+
   return jsxs('div', {
     className: 'flex flex-col gap-2',
     children: [
@@ -584,25 +631,43 @@ function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRe
               jsx('span', { className: 'min-w-0 truncate', children: provider.name })
             ]
           }),
+          usable ? null : jsx(Badge, { variant: 'muted', size: 'xs', children: 'no quota' }),
           jsx(Badge, { variant: 'outline', size: 'xs', children: String(groups.length) }),
+          jsx(Button, {
+            variant: 'ghost',
+            className: 'h-5 w-4 shrink-0 p-0',
+            disabled: !canMove.up,
+            title: `Move ${provider.name} up`,
+            onClick: () => onMove(-1),
+            children: jsx(Codicon, { name: 'arrow-up', size: '0.65rem' })
+          }),
+          jsx(Button, {
+            variant: 'ghost',
+            className: 'h-5 w-4 shrink-0 p-0',
+            disabled: !canMove.down,
+            title: `Move ${provider.name} down`,
+            onClick: () => onMove(1),
+            children: jsx(Codicon, { name: 'arrow-down', size: '0.65rem' })
+          }),
           jsx(RefreshButton, { busy, onRefresh: onRefreshProvider, label: `Refresh ${provider.name}` })
         ]
       }),
-      collapsed
-        ? null
-        : groups.map(group =>
-            jsx(
-              AccountCard,
-              {
-                account: group.account,
-                sharedCreds: group.creds,
-                active: group.active,
-                busy: group.creds.some(cred => Boolean(busyAccounts[`${provider.id}:${cred.fp}`])),
-                onRefresh: () => group.creds.filter(cred => cred.fp).forEach(cred => onRefreshAccount(provider.id, cred.fp, cred.label))
-              },
-              `${provider.id}|${group.key}`
-            )
-          )
+      collapsed ? null : liveGroups.map(renderGroup),
+      // Accounts with no quota stay one click away: hidden while others work,
+      // listed directly once the whole section is expanded.
+      !collapsed && usable && deadGroups.length
+        ? jsxs('button', {
+            type: 'button',
+            className: 'flex items-center gap-1 text-left text-[0.65rem] text-(--ui-text-quaternary)',
+            'aria-expanded': !deadCollapsed,
+            onClick: () => setCollapsed(deadKey, !deadCollapsed),
+            children: [
+              jsx(Codicon, { name: deadCollapsed ? 'chevron-right' : 'chevron-down', size: '0.65rem' }),
+              `${deadGroups.length} without quota`
+            ]
+          })
+        : null,
+      !collapsed && (!usable || !deadCollapsed) ? deadGroups.map(renderGroup) : null
     ]
   })
 }
@@ -1286,7 +1351,13 @@ function QuotaPane() {
   // Filter at render too: a cached payload from before a toggle must not
   // keep showing a section the user just hid.
   const routers = ((query.data && query.data.routers) || []).filter(router => prefs.sections[router.id] !== false)
-  const shownProviders = usableProviders(((query.data && query.data.providers) || []).filter(provider => prefs.sections[provider.id] !== false))
+  const shownProviders = orderedProviders(
+    ((query.data && query.data.providers) || []).filter(provider => prefs.sections[provider.id] !== false),
+    prefs.order
+  )
+  const liveProviders = shownProviders
+    .map(provider => ({ ...provider, accounts: (provider.accounts || []).filter(hasQuota) }))
+    .filter(provider => provider.accounts.length > 0)
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-3 overflow-y-auto p-3 text-sm',
@@ -1354,11 +1425,13 @@ function QuotaPane() {
           : jsxs('div', {
               className: 'flex flex-col gap-3',
               children: [
-                ...shownProviders.map(provider =>
+                ...shownProviders.map((provider, index) =>
                   jsx(
                     ProviderSection,
                     {
                       provider,
+                      canMove: { up: index > 0, down: index < shownProviders.length - 1 },
+                      onMove: delta => moveSection(shownProviders.map(item => item.id), provider.id, delta),
                       busy: Boolean(busyProviders[provider.id]),
                       busyAccounts,
                       onRefreshProvider: () => refreshProvider(provider.id),
@@ -1368,7 +1441,7 @@ function QuotaPane() {
                   )
                 ),
                 ...(!shownProviders.length && !routers.length && !query.isFetching
-                  ? [jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: (Object.values(prefs.sections).some(Boolean) ? 'No active subscription found.' : 'Nothing selected — open ⚙ to choose providers.') }, 'empty')]
+                  ? [jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: 'Nothing selected — open ⚙ to choose providers.' }, 'empty')]
                   : []),
                 ...(routers.length
                   ? [
@@ -1389,7 +1462,7 @@ function QuotaPane() {
               ]
             }),
       // Bottom summary: the live credential per provider (the list keeps all).
-      jsx(ActiveAccountPanel, { providers: shownProviders })
+      jsx(ActiveAccountPanel, { providers: liveProviders })
     ]
   })
 }

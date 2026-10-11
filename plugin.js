@@ -66,7 +66,8 @@ const DEFAULT_PREFS = {
   sections: Object.fromEntries([...PROVIDER_IDS, ...ROUTER_IDS].map(id => [id, true])),
   chip: true,
   notes: true,
-  plan: true
+  plan: true,
+  collapsed: {}
 }
 const PREFS_KEY = 'displayPrefs'
 let prefsStorage = null
@@ -84,7 +85,15 @@ function normalizePrefs(raw) {
 
   const flag = key => (typeof value[key] === 'boolean' ? value[key] : DEFAULT_PREFS[key])
 
-  return { sections, chip: flag('chip'), notes: flag('notes'), plan: flag('plan') }
+  const collapsed = {}
+
+  for (const [id, on] of Object.entries(value.collapsed && typeof value.collapsed === 'object' ? value.collapsed : {})) {
+    if (on === true) {
+      collapsed[id] = true
+    }
+  }
+
+  return { sections, chip: flag('chip'), notes: flag('notes'), plan: flag('plan'), collapsed }
 }
 
 function setPrefs(update) {
@@ -95,6 +104,15 @@ function setPrefs(update) {
   }
   // Newly enabled sections must load; disabled ones drop out of the poll.
   void queryClient.invalidateQueries({ queryKey: QUERY_KEY })
+}
+
+// Collapsing a section is purely visual: persist it without re-probing.
+function setCollapsed(id, on) {
+  const next = normalizePrefs({ ...$prefs.get(), collapsed: { ...$prefs.get().collapsed, [id]: on } })
+  $prefs.set(next)
+  if (prefsStorage) {
+    prefsStorage.set(PREFS_KEY, next)
+  }
 }
 
 const enabledIds = (ids, prefs = $prefs.get()) => ids.filter(id => prefs.sections[id] !== false)
@@ -309,7 +327,7 @@ function RefreshButton({ busy, onRefresh, label }) {
 function WindowRow({ window: w }) {
   const pct = Math.max(0, Math.min(100, Number(w.pct) || 0))
   const shown = pct % 1 === 0 ? `${pct}` : pct.toFixed(1)
-  const meta = [w.note, resetLabel(w.reset)].filter(Boolean).join(' · ')
+  const reset = resetLabel(w.reset)
 
   return jsxs('div', {
     className: 'flex flex-col gap-1',
@@ -317,10 +335,10 @@ function WindowRow({ window: w }) {
       jsxs('div', {
         className: 'flex items-baseline justify-between gap-2 text-[0.6875rem]',
         children: [
-          jsx('span', { className: 'truncate text-(--ui-text-tertiary)', children: w.k }),
+          jsx('span', { className: 'min-w-0 truncate text-(--ui-text-tertiary)', children: w.k }),
           jsxs('span', {
-            className: 'shrink-0 tabular-nums text-(--ui-text-secondary)',
-            children: [jsx('span', { children: `${shown}%` }), meta ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: ` · ${meta}` }) : null]
+            className: 'shrink-0 whitespace-nowrap tabular-nums text-(--ui-text-secondary)',
+            children: [jsx('span', { children: `${shown}%` }), reset ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: ` · ${reset}` }) : null]
           })
         ]
       }),
@@ -330,7 +348,8 @@ function WindowRow({ window: w }) {
           className: 'h-full rounded-full bg-(--ui-accent)',
           style: { width: `${pct}%` }
         })
-      })
+      }),
+      w.note ? jsx('div', { className: 'truncate text-[0.6rem] text-(--ui-text-quaternary)', title: w.note, children: w.note }) : null
     ]
   })
 }
@@ -385,7 +404,7 @@ function AccountCard({ account, sharedCreds, busy, onRefresh, active }) {
         ? jsx('div', { className: 'truncate text-[0.65rem] text-(--ui-text-quaternary)', children: account.sub })
         : null,
       windows.length
-        ? jsxs('div', { className: 'flex flex-col gap-2', children: windows.map(w => jsx(WindowRow, { window: w, key: w.k })) })
+        ? jsxs('div', { className: 'flex flex-col gap-2', children: windows.map((w, i) => jsx(WindowRow, { window: i > 0 && windows[i - 1].note === w.note ? { ...w, note: null } : w, key: w.k })) })
         : null,
       merged
         ? jsx('div', {
@@ -513,7 +532,20 @@ function ActiveAccountPanel({ providers }) {
   })
 }
 
+// An account with no quota window has nothing to show: no subscription, a
+// rejected key, or an ineligible login. Those are hidden, not listed as errors,
+// and a provider left with no usable account disappears entirely.
+const hasQuota = account => (account.windows || []).length > 0
+
+function usableProviders(providers) {
+  return (providers || [])
+    .map(provider => ({ ...provider, accounts: (provider.accounts || []).filter(hasQuota) }))
+    .filter(provider => provider.accounts.length > 0)
+}
+
 function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRefreshAccount }) {
+  const prefs = useValue($prefs)
+  const collapsed = prefs.collapsed[provider.id] === true
   // Credentials that resolve to the same account share one quota — collapse
   // them into a single card; the card lists the credentials that share it.
   const groups = []
@@ -541,13 +573,23 @@ function ProviderSection({ provider, busy, busyAccounts, onRefreshProvider, onRe
       jsxs('div', {
         className: 'flex items-center gap-1.5',
         children: [
-          jsx('div', { className: 'min-w-0 flex-1 truncate text-xs font-medium', children: provider.name }),
+          jsxs('button', {
+            type: 'button',
+            className: 'flex min-w-0 flex-1 items-center gap-1 text-left text-xs font-medium',
+            title: collapsed ? `Expand ${provider.name}` : `Collapse ${provider.name}`,
+            'aria-expanded': !collapsed,
+            onClick: () => setCollapsed(provider.id, !collapsed),
+            children: [
+              jsx(Codicon, { name: collapsed ? 'chevron-right' : 'chevron-down', size: '0.75rem' }),
+              jsx('span', { className: 'min-w-0 truncate', children: provider.name })
+            ]
+          }),
           jsx(Badge, { variant: 'outline', size: 'xs', children: String(groups.length) }),
           jsx(RefreshButton, { busy, onRefresh: onRefreshProvider, label: `Refresh ${provider.name}` })
         ]
       }),
-      groups.length === 0
-        ? jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: 'no credentials found' })
+      collapsed
+        ? null
         : groups.map(group =>
             jsx(
               AccountCard,
@@ -1244,7 +1286,7 @@ function QuotaPane() {
   // Filter at render too: a cached payload from before a toggle must not
   // keep showing a section the user just hid.
   const routers = ((query.data && query.data.routers) || []).filter(router => prefs.sections[router.id] !== false)
-  const shownProviders = ((query.data && query.data.providers) || []).filter(provider => prefs.sections[provider.id] !== false)
+  const shownProviders = usableProviders(((query.data && query.data.providers) || []).filter(provider => prefs.sections[provider.id] !== false))
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-3 overflow-y-auto p-3 text-sm',
@@ -1326,7 +1368,7 @@ function QuotaPane() {
                   )
                 ),
                 ...(!shownProviders.length && !routers.length && !query.isFetching
-                  ? [jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: 'Nothing selected — open ⚙ to choose providers.' }, 'empty')]
+                  ? [jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: (Object.values(prefs.sections).some(Boolean) ? 'No active subscription found.' : 'Nothing selected — open ⚙ to choose providers.') }, 'empty')]
                   : []),
                 ...(routers.length
                   ? [

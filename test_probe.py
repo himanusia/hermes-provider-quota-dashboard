@@ -698,6 +698,36 @@ class SnapshotAndAntigravityTests(unittest.TestCase):
                      "home_dir": os.path.join(root, "acc", "work")}]}, handle)
             self.assertEqual([a["label"] for a in probe.antigravity_accounts()], ["#1", "#0"])
 
+    def test_antigravity_refused_account_is_flagged_and_never_metered(self):
+        root = self.tmp.name
+        home = os.path.join(root, "acc", "gone")
+        directory = os.path.join(home, ".gemini", "antigravity-cli")
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "antigravity-oauth-token"), "w") as handle:
+            json.dump({"access_token": "gone-token", "expiry": "2099-01-01T00:00:00Z"}, handle)
+        registry = os.path.join(root, "accounts.json")
+        with open(registry, "w") as handle:
+            json.dump({"accounts": [{"id": 2, "home_dir": home, "enabled": True, "eligible": False,
+                                     "state": "not_eligible"}]}, handle)
+        env = {"HERMES_QUOTA_NO_KEYCHAIN": "1", "ANTIGRAVITY_ACCOUNTS_FILE": registry}
+        with patch.object(probe, "HOME", root), patch.object(probe, "ENV", {}), \
+                patch.dict(probe.os.environ, env, clear=False):
+            probe.os.environ.pop("ANTIGRAVITY_CONFIG_DIR", None)
+            accounts = probe.antigravity_accounts()
+        refused = [a for a in accounts if a["label"] == "#2"]
+        self.assertEqual(refused[0]["refused"], "not_eligible")
+        # No network call and no snapshot fallback: the API would answer zeros.
+        with patch.object(probe.httpx, "post", side_effect=AssertionError("must not query")):
+            row = probe.probe_antigravity(refused[0])
+        self.assertEqual(row["windows"], [])
+        self.assertIn("not eligible", row["error"])
+
+    def test_plugin_hides_providers_without_a_usable_account_and_can_collapse(self):
+        source = (Path(__file__).parent / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function usableProviders(", source)
+        self.assertIn("usableProviders(((query.data", source)
+        self.assertIn("function setCollapsed(", source)
+
 
 class FakePool:
     """Stand-in for ``CredentialPool`` recording what the probe asked of it."""

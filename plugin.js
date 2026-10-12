@@ -1472,7 +1472,10 @@ function paneContribution() {
     id: 'pane',
     area: 'panes',
     title: 'quotas',
-    data: { placement: 'right', width: '300px' },
+    // uncloseable: the app's tab-close on a plugin's ONLY pane disables the
+    // whole plugin (persisted in pluginDecisions.v2), killing the chip, nav row
+    // and commands until re-enabled in Capabilities. Hide via chip / palette.
+    data: { placement: 'right', width: '300px', uncloseable: true },
     render: () => jsx(QuotaPane, {})
   }
 }

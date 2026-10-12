@@ -901,5 +901,13 @@ class ActiveAccountTests(unittest.TestCase):
         self.assertEqual(before, hashlib.sha256(path.read_bytes()).hexdigest())
 
 
+class PaneCloseTrapTests(unittest.TestCase):
+    def test_pane_is_uncloseable(self):
+        """Closing a plugin's only pane tab makes the desktop app disable the
+        whole plugin (persisted), so the pane must not offer a close button."""
+        source = (Path(__file__).parent / "plugin.js").read_text(encoding="utf-8")
+        self.assertRegex(source, r"placement: 'right'[^}]*uncloseable: true")
+
+
 if __name__ == "__main__":
     unittest.main()

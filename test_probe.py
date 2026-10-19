@@ -514,6 +514,73 @@ class ClaudeSubscriptionProbeTests(unittest.TestCase):
         self.assertIn("no credential", source)
 
 
+class NativeAnthropicProviderTests(unittest.TestCase):
+    """Hermes' built-in `anthropic` provider (the Claude Code login behind
+    provider id `anthropic`) is metered on demand, so the dock never falls back
+    to \"anthropic · quota unsupported\"."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.snap = patch.object(probe, "SNAPSHOT_DIR", self.tmp.name)
+        self.snap.start()
+
+    def tearDown(self):
+        self.snap.stop()
+        self.tmp.cleanup()
+
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def test_registered_on_demand_so_the_pane_has_no_duplicate_row(self):
+        self.assertNotIn("anthropic", [p["id"] for p in probe.PROVIDERS])
+        entry = next(p for p in probe.ON_DEMAND_PROVIDERS if p["id"] == "anthropic")
+        self.assertIs(entry["accounts"], probe.anthropic_accounts)
+        self.assertIs(entry["probe"], probe.probe_anthropic)
+
+    def test_an_oauth_credential_reads_the_claude_usage_endpoint(self):
+        seen = {}
+
+        def get(url, headers=None, timeout=None):
+            seen["url"], seen["headers"] = url, headers
+            return self.Response(200, {"five_hour": {"utilization": 27.0, "resets_at": "2026-10-19T13:10:00+07:00"},
+                                       "seven_day": {"utilization": 33.0, "resets_at": "2026-10-24T21:00:00+07:00"}})
+
+        account = {"label": "Claude Code login (keychain)", "token": "sample-oauth-token", "base": "",
+                   "fp": "1b3219fda304", "api_key": False, "expires": (time.time() + 3600) * 1000}
+        with patch.object(probe.httpx, "get", get):
+            row = probe.probe_anthropic(account)
+        self.assertTrue(seen["url"].endswith("/api/oauth/usage"))
+        self.assertEqual([w["k"] for w in row["windows"]], ["session (5h)", "weekly"])
+        self.assertEqual(row["windows"][0]["pct"], 27.0)
+        self.assertIsNone(row["error"])
+        self.assertNotIn("sample-oauth-token", json.dumps(row))
+
+    def test_a_console_api_key_is_never_probed_for_subscription_windows(self):
+        calls = []
+        with patch.object(probe.httpx, "get", lambda *a, **k: calls.append(a)):
+            row = probe.probe_anthropic({"label": "ANTHROPIC_API_KEY (env)", "token": "sk-ant-api03-sample",
+                                        "base": "", "fp": "deadbeef", "api_key": True})
+        self.assertEqual(calls, [])
+        self.assertEqual(row["windows"], [])
+        self.assertIn("API key", row["notes"][0])
+
+    def test_the_env_token_wins_the_way_hermes_resolves_it(self):
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": "sample-oauth-token"}
+        with patch.dict(probe.os.environ, env, clear=False), patch.object(probe, "ENV", {}):
+            for name in ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY"):
+                probe.os.environ.pop(name, None)
+            accounts = probe.anthropic_accounts()
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["label"], "CLAUDE_CODE_OAUTH_TOKEN (env)")
+        self.assertFalse(accounts[0]["api_key"])
+        self.assertEqual(accounts[0]["token"], "sample-oauth-token")
+
+
 class SnapshotAndAntigravityTests(unittest.TestCase):
     class Response:
         def __init__(self, status_code, payload):

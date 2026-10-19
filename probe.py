@@ -1424,6 +1424,44 @@ def _probe_claude(account: dict, live) -> dict:
     return row
 
 
+# The NATIVE `anthropic` provider (Hermes' built-in Anthropic Messages route,
+# provider id `anthropic`) is not the DirectSDK plugin, so the TUI widget's
+# provider map used to miss it and the dock read "anthropic · quota unsupported"
+# while the very same Claude login was metered fine under `claude-subscription`.
+# Resolve the credential the way Hermes' own `resolve_anthropic_token()` does
+# (env token -> API key -> Claude Code login) and meter THAT credential.
+ANTHROPIC_API_KEY_PREFIXES = ("sk-ant-api", "sk-ant-usr", "sk-ant-svc", "sk-ant-admin")
+
+
+def _anthropic_is_api_key(token: str) -> bool:
+    return token.startswith(ANTHROPIC_API_KEY_PREFIXES)
+
+
+def anthropic_accounts() -> list:
+    """The single credential Hermes' native `anthropic` provider would use."""
+    for name in ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        token = (os.environ.get(name) or ENV.get(name) or "").strip()
+        if token:
+            return [{"label": f"{name} (env)", "token": token, "base": CLAUDE_DEFAULT_BASE,
+                     "fp": sha(token)[:12], "api_key": _anthropic_is_api_key(token)}]
+    # No env credential: Hermes borrows the Claude Code login (Keychain / credentials.json).
+    for account in claude_accounts():
+        account = dict(account)
+        account["api_key"] = False
+        return [account]
+    return []
+
+
+def probe_anthropic(account: dict) -> dict:
+    if account.get("api_key"):
+        # Console API keys bill per token and have no subscription windows; the
+        # OAuth usage endpoint answers 401 for them, so never probe it.
+        return {"label": account["label"], "sub": f"fp {sha(account['token'])[:6]} - API key",
+                "plan": None, "windows": [], "error": None,
+                "notes": ["API key billing - no subscription quota windows"]}
+    return with_snapshot("anthropic", account, lambda live: _probe_claude(account, live))
+
+
 # agy reads its own quota from the "daily" host (verified in agy's cli.log:
 # POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary).
 # The plain cloudcode-pa host answers 200 but reports stale/zero numbers for
@@ -1686,6 +1724,15 @@ PROVIDERS = (
      "base": ANTIGRAVITY_DEFAULT_BASE, "probe": probe_antigravity, "accounts": antigravity_accounts},
 )
 
+# Probed only when explicitly requested (`--provider <id>`), never in the pane's
+# full inventory. The native `anthropic` provider resolves to the SAME Claude
+# account as `claude-subscription`; listing it in the pane would render the same
+# numbers twice. The TUI dock asks for it by id, so it must still exist here.
+ON_DEMAND_PROVIDERS = (
+    {"id": "anthropic", "name": "Anthropic", "env_var": "", "base": CLAUDE_DEFAULT_BASE,
+     "probe": probe_anthropic, "accounts": anthropic_accounts},
+)
+
 
 def parse_filters(argv):
     """Parse provider/account filters and local-router-only inspection options."""
@@ -1724,7 +1771,8 @@ def main() -> int:
 
     jobs = []
     per_provider = {}
-    for provider in PROVIDERS:
+    extra = [p for p in ON_DEMAND_PROVIDERS if p["id"] in wanted] if wanted else []
+    for provider in (*PROVIDERS, *extra):
         pid = provider["id"]
         if router_only:
             continue
@@ -1802,7 +1850,7 @@ def main() -> int:
                 )
 
     provider_payload = []
-    for provider in PROVIDERS:
+    for provider in (*PROVIDERS, *extra):
         pid = provider["id"]
         if pid not in per_provider:
             continue
